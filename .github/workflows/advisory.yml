@@ -1,0 +1,54 @@
+# Advisory (non-blocking) quality lane.
+#
+# Both jobs use `continue-on-error: true` so they never gate merges:
+# unit_tests.yml remains the blocking gate. No fmt job here on purpose --
+# formatting.yml already enforces clang-format + cargo fmt as blocking,
+# matching the microsandbox Check reference where Format/Clippy/Docs are
+# all blocking (there is no `continue-on-error` anywhere in its .github/).
+name: Advisory
+on: [pull_request]
+
+# Adapted from microsandbox Check (`group: <workflow>-<ref>`,
+# `cancel-in-progress: github.ref != 'refs/heads/main'`). This workflow is
+# PR-only, so plain `true` is equivalent for non-main refs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  advisory-clippy:
+    name: Advisory Clippy (workspace)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Create a fake init
+        run: touch init/init
+
+      - name: Clippy (workspace, advisory)
+        run: cargo clippy --workspace --locked -- -D warnings
+
+  advisory-docs:
+    name: Advisory Docs (workspace)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Create a fake init
+        run: touch init/init
+
+      - name: Docs (advisory)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
