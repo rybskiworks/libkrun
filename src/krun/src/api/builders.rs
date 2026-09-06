@@ -119,6 +119,9 @@ pub struct VsockBuilder {
     pub(crate) tcp_listen_remaps: Vec<(u16, u16)>,
     #[cfg(not(target_os = "windows"))]
     pub(crate) enable_inet_hijack: bool,
+    /// Explicit guest CID override. `None` (default) auto-allocates a
+    /// process-unique CID at [`VmBuilder::build`](crate::VmBuilder::build) time.
+    pub(crate) guest_cid: Option<u32>,
 }
 
 /// One typed host-side route for a guest vsock destination port.
@@ -849,6 +852,19 @@ impl VsockBuilder {
     #[cfg(not(target_os = "windows"))]
     pub fn inet_hijack(mut self, enabled: bool) -> Self {
         self.enable_inet_hijack = enabled;
+        self
+    }
+
+    /// Pin the guest vsock Context Identifier (CID) for the VM.
+    ///
+    /// The CID must not be 0, 1 or 2 (reserved; 2 addresses the host) and
+    /// must not already be assigned to another VM in this process — a
+    /// duplicate fails [`VmBuilder::build`](crate::VmBuilder::build) with a
+    /// vsock configuration error instead of being silently reused.
+    ///
+    /// When unset (default), `build()` auto-allocates a process-unique CID.
+    pub fn guest_cid(mut self, cid: u32) -> Self {
+        self.guest_cid = Some(cid);
         self
     }
 }

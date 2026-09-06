@@ -957,6 +957,39 @@ int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
 int32_t krun_get_shutdown_eventfd(uint32_t ctx_id);
 
 /**
+ * Returns the process-unique guest vsock CID assigned to a context.
+ *
+ * Every context receives its CID eagerly in "krun_create_ctx" from the same
+ * process-global allocator the Rust API uses, so C-created and Rust-created
+ * VMs never collide. The CID is valid regardless of whether vsock ends up
+ * enabled for the context, and on every target (including Windows).
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "out_cid"   - pointer receiving the guest CID on success.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_get_guest_cid(uint32_t ctx_id, uint32_t *out_cid);
+
+/**
+ * Pins the guest vsock CID for a context. Must be called before "krun_start_enter".
+ *
+ * The CID must not be 0, 1 or 2 (reserved; 2 addresses the host) and must
+ * not already be assigned to another VM in this process: collisions fail
+ * with an error instead of being silently reused.
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "cid"       - the guest CID to pin for this context.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_guest_cid(uint32_t ctx_id, uint32_t cid);
+
+/**
  * Configures the console device to ignore stdin and write the output to "c_filepath".
  *
  * Arguments:

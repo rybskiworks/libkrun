@@ -67,6 +67,7 @@ use vmm::vmm_config::machine_config::VmConfig;
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 #[cfg(not(target_os = "windows"))]
 use vmm::vmm_config::vsock::VsockDeviceConfig;
+use vmm::vmm_config::vsock::{allocate_guest_cid, reserve_guest_cid, VsockConfigError};
 
 #[cfg(feature = "aws-nitro")]
 use aws_nitro::enclave::NitroEnclave;
@@ -160,6 +161,12 @@ struct ContextConfig {
     tsi_port_map: Option<HashMap<u16, u16>>,
     #[cfg(not(target_os = "windows"))]
     vsock_config: VsockConfig,
+    /// Process-unique guest vsock CID for this context, allocated once in
+    /// [`krun_create_ctx`] from the same process-global space the Rust API
+    /// (`msb_krun`) allocates from. Pinnable before start with
+    /// [`krun_set_guest_cid`]. Unused (but still unique) when vsock ends up
+    /// disabled; wasted CIDs are never reused.
+    guest_cid: u32,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
     #[cfg(feature = "blk")]
@@ -585,10 +592,23 @@ pub extern "C" fn krun_create_ctx() -> i32 {
         None
     };
 
+    // Allocate the guest CID eagerly so every context owns a process-unique
+    // vsock identity from birth, even if vsock ends up disabled (wasted CIDs
+    // are fine; the space is huge). Exhaustion is practically impossible, but
+    // fails closed with a negative errno instead of a context id.
+    let guest_cid = match allocate_guest_cid() {
+        Ok(cid) => cid,
+        Err(e) => {
+            error!("Failed to allocate guest CID: {e}");
+            return -libc::ENOMEM;
+        }
+    };
+
     let ctx_cfg = {
         ContextConfig {
             krunfw: KrunfwBindings::new(),
             shutdown_efd,
+            guest_cid,
             ..Default::default()
         }
     };
@@ -1945,6 +1965,57 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
     }
 }
 
+/// Returns the process-unique guest vsock CID assigned to a context.
+///
+/// Every context receives its CID eagerly in `krun_create_ctx` from the same
+/// process-global allocator the Rust API uses, so C-created and Rust-created
+/// VMs never collide. The CID is valid regardless of whether vsock ends up
+/// enabled for the context, and on every target (including Windows).
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_get_guest_cid(ctx_id: u32, out_cid: *mut u32) -> i32 {
+    if out_cid.is_null() {
+        return -libc::EINVAL;
+    }
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(ctx_cfg) => {
+            *out_cid = ctx_cfg.get().guest_cid;
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+/// Pins the guest vsock CID for a context. Must be called before `krun_start_enter`.
+///
+/// The CID must not be 0, 1 or 2 (reserved; 2 addresses the host) and must
+/// not already be assigned to another VM in this process: collisions fail
+/// with an error instead of being silently reused. On success the context's
+/// `krun_create_ctx` allocation is superseded (it stays reserved, never
+/// reused — wasted CIDs are fine).
+#[no_mangle]
+pub extern "C" fn krun_set_guest_cid(ctx_id: u32, cid: u32) -> i32 {
+    // Reserve before touching CTX_MAP so the two locks (allocator, CTX_MAP)
+    // are never held nested, in either order. A reservation for an unknown
+    // context is wasted but harmless.
+    if let Err(e) = reserve_guest_cid(cid) {
+        return match e {
+            VsockConfigError::InvalidGuestCid(_) => -libc::EINVAL,
+            VsockConfigError::GuestCidInUse(_) => -libc::EEXIST,
+            _ => -libc::ENOMEM,
+        };
+    }
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().guest_cid = cid;
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32 {
@@ -2858,7 +2929,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         VsockConfig::Explicit { tsi_flags } => {
             let vsock_device_config = VsockDeviceConfig {
                 vsock_id: "vsock0".to_string(),
-                guest_cid: 3,
+                guest_cid: ctx_cfg.guest_cid,
                 host_port_map: ctx_cfg.tsi_port_map,
                 unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                 custom_port_map: None,
@@ -2886,7 +2957,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
                 let vsock_device_config = VsockDeviceConfig {
                     vsock_id: "vsock0".to_string(),
-                    guest_cid: 3,
+                    guest_cid: ctx_cfg.guest_cid,
                     host_port_map,
                     unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
                     custom_port_map: None,
@@ -3008,6 +3079,87 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_cid_is_unique_per_context() {
+        let first = krun_create_ctx();
+        let second = krun_create_ctx();
+        assert!(first >= 0 && second >= 0 && first != second);
+
+        let mut first_cid = 0u32;
+        let mut second_cid = 0u32;
+        assert_eq!(
+            unsafe { krun_get_guest_cid(first as u32, &mut first_cid) },
+            KRUN_SUCCESS
+        );
+        assert_eq!(
+            unsafe { krun_get_guest_cid(second as u32, &mut second_cid) },
+            KRUN_SUCCESS
+        );
+        assert!(first_cid >= 3 && second_cid >= 3);
+        assert_ne!(first_cid, second_cid);
+
+        assert_eq!(krun_free_ctx(first as u32), KRUN_SUCCESS);
+        assert_eq!(krun_free_ctx(second as u32), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn get_guest_cid_rejects_bad_arguments() {
+        assert_eq!(
+            unsafe { krun_get_guest_cid(u32::MAX, std::ptr::null_mut()) },
+            -libc::EINVAL
+        );
+
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        assert_eq!(
+            unsafe { krun_get_guest_cid(ctx_id as u32, std::ptr::null_mut()) },
+            -libc::EINVAL
+        );
+        let mut cid = 0u32;
+        assert_eq!(
+            unsafe { krun_get_guest_cid(u32::MAX, &mut cid) },
+            -libc::ENOENT
+        );
+
+        assert_eq!(krun_free_ctx(ctx_id as u32), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn set_guest_cid_pins_and_rejects_collisions() {
+        // Offsets far ahead of the monotonic counter so no parallel test can
+        // race these reservations.
+        let pinned = allocate_guest_cid()
+            .expect("CID space must not exhaust in tests")
+            .wrapping_add(1 << 20)
+            .wrapping_add(2);
+
+        let ctx_id = krun_create_ctx();
+        assert!(ctx_id >= 0);
+        assert_eq!(krun_set_guest_cid(ctx_id as u32, pinned), KRUN_SUCCESS);
+        let mut cid = 0u32;
+        assert_eq!(
+            unsafe { krun_get_guest_cid(ctx_id as u32, &mut cid) },
+            KRUN_SUCCESS
+        );
+        assert_eq!(cid, pinned);
+
+        let other_ctx = krun_create_ctx();
+        assert!(other_ctx >= 0);
+        // Collision with the first context's pin must fail, not reuse.
+        assert_eq!(krun_set_guest_cid(other_ctx as u32, pinned), -libc::EEXIST);
+        // Reserved host CID must fail.
+        assert_eq!(krun_set_guest_cid(other_ctx as u32, 2), -libc::EINVAL);
+        // Unknown context must fail (its reservation is wasted, harmless).
+        let stray = allocate_guest_cid()
+            .expect("CID space must not exhaust in tests")
+            .wrapping_add(1 << 20)
+            .wrapping_add(3);
+        assert_eq!(krun_set_guest_cid(u32::MAX, stray), -libc::ENOENT);
+
+        assert_eq!(krun_free_ctx(ctx_id as u32), KRUN_SUCCESS);
+        assert_eq!(krun_free_ctx(other_ctx as u32), KRUN_SUCCESS);
+    }
 
     #[cfg(not(feature = "tee"))]
     #[test]
