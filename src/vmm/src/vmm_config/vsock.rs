@@ -1,10 +1,11 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(not(target_os = "windows"))]
 use devices::virtio::vsock::VsockDatagramPortBackend;
@@ -32,6 +33,12 @@ pub enum VsockConfigError {
     CreateVsockDevice(VsockError),
     /// A custom datagram route overlaps a device-owned protocol port.
     ReservedDatagramPort { port: u32, owner: &'static str },
+    /// A guest CID was explicitly requested that is reserved for the host.
+    InvalidGuestCid(u32),
+    /// A guest CID was explicitly requested that is already assigned to another VM.
+    GuestCidInUse(u32),
+    /// The process-global guest CID space is exhausted.
+    GuestCidExhausted,
 }
 
 impl fmt::Display for VsockConfigError {
@@ -45,11 +52,99 @@ impl fmt::Display for VsockConfigError {
                     "Cannot route vsock datagram port {port}: reserved for {owner}"
                 )
             }
+            InvalidGuestCid(cid) => write!(
+                f,
+                "Invalid guest CID {cid}: CIDs 0, 1 and 2 are reserved (host CID is 2)"
+            ),
+            GuestCidInUse(cid) => {
+                write!(f, "Guest CID {cid} is already assigned to another VM")
+            }
+            GuestCidExhausted => write!(f, "No unassigned guest CID remains"),
         }
     }
 }
 
 type Result<T> = std::result::Result<T, VsockConfigError>;
+
+//--------------------------------------------------------------------------------------------------
+// Guest CID allocation
+//--------------------------------------------------------------------------------------------------
+
+/// First assignable guest CID.
+///
+/// CIDs 0 and 1 are reserved by the vsock specification and CID 2 addresses
+/// the host (`VSOCK_HOST_CID`). Allocation starts at 3, preserving the legacy
+/// single-VM behavior for the first VM in a process.
+pub const FIRST_GUEST_CID: u32 = 3;
+
+/// Next candidate CID handed out by [`allocate_guest_cid`].
+///
+/// Monotonically increasing; wasted values (explicitly reserved CIDs that the
+/// counter steps over, or CIDs allocated for contexts whose vsock ends up
+/// disabled) are never reused. The space is effectively inexhaustible, but
+/// exhaustion fails closed (see [`VsockConfigError::GuestCidExhausted`]).
+static NEXT_GUEST_CID: AtomicU32 = AtomicU32::new(FIRST_GUEST_CID);
+
+/// Every CID currently owned by a VM in this process, whether auto-allocated
+/// or explicitly reserved via [`reserve_guest_cid`].
+static USED_GUEST_CIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn used_guest_cids() -> &'static Mutex<HashSet<u32>> {
+    USED_GUEST_CIDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Allocate a process-unique guest CID.
+///
+/// Returns CIDs starting at [`FIRST_GUEST_CID`] (3), monotonically increasing,
+/// and never returns 0, 1 or 2. CIDs pinned beforehand with
+/// [`reserve_guest_cid`] are skipped, never handed out twice. Shared by the
+/// Rust (`msb_krun`) and C (`libkrun`) VM-creation paths so VMs created
+/// through either API in one process never collide.
+pub fn allocate_guest_cid() -> Result<u32> {
+    let used = used_guest_cids();
+    let mut guard = used.lock().unwrap();
+    loop {
+        let cid = NEXT_GUEST_CID.load(Ordering::Relaxed);
+        if cid < FIRST_GUEST_CID {
+            // Counter wrapped past u32::MAX into the reserved range, which we
+            // use as the exhausted sentinel (see below).
+            return Err(VsockConfigError::GuestCidExhausted);
+        }
+        // Claim `cid`; on wrap, park the counter on the 0 sentinel so later
+        // callers observe exhaustion instead of re-issuing low CIDs.
+        let next = cid.checked_add(1).unwrap_or(0);
+        if NEXT_GUEST_CID
+            .compare_exchange_weak(cid, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            continue;
+        }
+        if guard.contains(&cid) {
+            // Explicitly reserved ahead of the counter; burn the value and
+            // move on. The space is huge, reuse is not worth the bookkeeping.
+            continue;
+        }
+        guard.insert(cid);
+        return Ok(cid);
+    }
+}
+
+/// Pin a specific guest CID for a VM.
+///
+/// Rejects CIDs 0, 1 and 2 ([`VsockConfigError::InvalidGuestCid`]) and CIDs
+/// already allocated or reserved ([`VsockConfigError::GuestCidInUse`]); the
+/// allocator will never hand out a successfully reserved CID.
+pub fn reserve_guest_cid(cid: u32) -> Result<()> {
+    if cid < FIRST_GUEST_CID {
+        return Err(VsockConfigError::InvalidGuestCid(cid));
+    }
+    let used = used_guest_cids();
+    let mut guard = used.lock().unwrap();
+    if !guard.insert(cid) {
+        return Err(VsockConfigError::GuestCidInUse(cid));
+    }
+    Ok(())
+}
 
 /// This struct represents the strongly typed equivalent of the json body
 /// from vsock related requests.
@@ -252,6 +347,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_guest_cid_allocation_unique_valid_and_respects_reservations() {
+        use super::VsockConfigError::*;
+        use std::collections::HashSet;
+
+        // The counter is process-global, so assert properties
+        // (uniqueness/validity), never exact values.
+        for cid in [0, 1, 2] {
+            assert!(
+                matches!(reserve_guest_cid(cid), Err(InvalidGuestCid(_))),
+                "CID {cid} must be rejected as reserved"
+            );
+        }
+
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            let cid = allocate_guest_cid().expect("CID space must not exhaust in tests");
+            assert!(
+                cid >= FIRST_GUEST_CID,
+                "allocated CID {cid} must not be reserved"
+            );
+            assert!(seen.insert(cid), "allocated CID {cid} handed out twice");
+        }
+
+        // An already-allocated CID cannot be reserved.
+        let allocated = allocate_guest_cid().unwrap();
+        assert!(matches!(
+            reserve_guest_cid(allocated),
+            Err(GuestCidInUse(_))
+        ));
+
+        // Pin a CID well ahead of the monotonic counter, then drain the
+        // counter past it: the allocator must skip the reservation every time.
+        let pinned = allocated.wrapping_add(4096);
+        assert!(pinned >= FIRST_GUEST_CID);
+        reserve_guest_cid(pinned).expect("fresh CID must reserve cleanly");
+        assert!(matches!(reserve_guest_cid(pinned), Err(GuestCidInUse(_))));
+        loop {
+            let cid = allocate_guest_cid().unwrap();
+            assert_ne!(cid, pinned, "allocator handed out a reserved CID");
+            if cid > pinned {
+                break;
+            }
+        }
+    }
+
+    #[test]
     fn test_error_messages() {
         use super::VsockConfigError::*;
         use std::io;
@@ -260,6 +401,9 @@ pub(crate) mod tests {
             io::Error::from_raw_os_error(0),
         ));
         let _ = format!("{err}{err:?}");
+        for err in [InvalidGuestCid(2), GuestCidInUse(3), GuestCidExhausted] {
+            let _ = format!("{err}{err:?}");
+        }
     }
 
     #[test]

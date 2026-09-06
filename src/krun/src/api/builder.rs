@@ -830,6 +830,19 @@ impl VmBuilder {
             .map_err(|e| Error::Build(BuildError::Start(format!("exit EventFd: {e:?}"))))?;
         let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
+        // Resolve the guest CID once per build so every VM owns a
+        // process-unique vsock identity. An explicit override is pinned via
+        // the shared allocator (collisions fail here, never silently reuse);
+        // otherwise a fresh CID is allocated from the same process-global
+        // space the C API (`libkrun`) allocates from.
+        let guest_cid = match self.vsock.guest_cid {
+            Some(cid) => vmm::vmm_config::vsock::reserve_guest_cid(cid)
+                .map(|()| cid)
+                .map_err(|e| Error::Config(ConfigError::Vsock(e.to_string())))?,
+            None => vmm::vmm_config::vsock::allocate_guest_cid()
+                .map_err(|e| Error::Config(ConfigError::Vsock(e.to_string())))?,
+        };
+
         Ok(Vm::new(
             vmr,
             self.kernel.cmdline,
@@ -845,6 +858,7 @@ impl VmBuilder {
             self.placement_observer,
             exit_evt,
             exit_code,
+            guest_cid,
             #[cfg(not(target_os = "windows"))]
             enable_inet_hijack,
             #[cfg(not(target_os = "windows"))]
@@ -1343,6 +1357,78 @@ mod tests {
 
         assert!(
             matches!(err, Error::Config(ConfigError::Vsock(message)) if message.contains("active TSI"))
+        );
+    }
+
+    #[test]
+    fn build_assigns_distinct_guest_cids() {
+        // build() needs no KVM, only enter() does, so CID assignment is
+        // directly testable host-side. The allocator is process-global:
+        // assert properties, never exact values.
+        let first = VmBuilder::new().build().expect("build must succeed");
+        let second = VmBuilder::new().build().expect("build must succeed");
+
+        assert!(first.guest_cid() >= 3);
+        assert!(second.guest_cid() >= 3);
+        assert_ne!(
+            first.guest_cid(),
+            second.guest_cid(),
+            "each built VM must own a unique guest CID"
+        );
+    }
+
+    #[test]
+    fn build_pins_guest_cid_override() {
+        // Offset far ahead of the monotonic counter, in a range disjoint from
+        // build_rejects_duplicate_guest_cid_override (1<<20 vs 1<<21), so no
+        // parallel test can race this reservation under any interleaving.
+        let pinned = vmm::vmm_config::vsock::allocate_guest_cid()
+            .expect("CID space must not exhaust in tests")
+            .wrapping_add(1 << 20);
+
+        let vm = VmBuilder::new()
+            .vsock(|vsock| vsock.guest_cid(pinned))
+            .build()
+            .expect("explicit CID pin must build");
+        assert_eq!(vm.guest_cid(), pinned);
+    }
+
+    #[test]
+    fn build_rejects_duplicate_guest_cid_override() {
+        // Disjoint range from build_pins_guest_cid_override (1<<20 vs 1<<21):
+        // total test-process allocations are in the tens, so the two pins
+        // can never coincide under any thread interleaving.
+        let pinned = vmm::vmm_config::vsock::allocate_guest_cid()
+            .expect("CID space must not exhaust in tests")
+            .wrapping_add(1 << 21);
+
+        VmBuilder::new()
+            .vsock(|vsock| vsock.guest_cid(pinned))
+            .build()
+            .expect("first pin of a CID must build");
+        let err = VmBuilder::new()
+            .vsock(|vsock| vsock.guest_cid(pinned))
+            .build()
+            .err()
+            .expect("second pin of the same CID must fail");
+
+        assert!(
+            matches!(err, Error::Config(ConfigError::Vsock(_))),
+            "duplicate CID pin must surface as a vsock config error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_rejects_reserved_guest_cid_override() {
+        let err = VmBuilder::new()
+            .vsock(|vsock| vsock.guest_cid(2))
+            .build()
+            .err()
+            .expect("host CID pin must fail");
+
+        assert!(
+            matches!(err, Error::Config(ConfigError::Vsock(_))),
+            "pinning the host CID must surface as a vsock config error, got: {err:?}"
         );
     }
 

@@ -62,6 +62,10 @@ pub struct Vm {
     exit_evt: EventFd,
     /// Shared exit code — written by the VMM, readable by exit observers.
     exit_code: Arc<AtomicI32>,
+    /// Process-unique vsock Context Identifier for this VM, resolved once in
+    /// [`VmBuilder::build()`](super::builder::VmBuilder::build) via the
+    /// shared vmm allocator (auto-allocated or explicitly pinned).
+    guest_cid: u32,
     /// Opt in to the automatic `TsiFlags::HIJACK_INET` fallback that
     /// bridges guest INET sockets to the host via vsock when no
     /// virtio-net device is configured. Set via
@@ -154,6 +158,7 @@ impl Vm {
         placement_observer: Option<PlacementObserver>,
         exit_evt: EventFd,
         exit_code: Arc<AtomicI32>,
+        guest_cid: u32,
         #[cfg(not(target_os = "windows"))] enable_inet_hijack: bool,
         #[cfg(not(target_os = "windows"))] vsock_unix_ipc_port_map: Option<
             HashMap<u32, (PathBuf, bool)>,
@@ -179,6 +184,7 @@ impl Vm {
             placement_observer,
             exit_evt,
             exit_code,
+            guest_cid,
             #[cfg(not(target_os = "windows"))]
             enable_inet_hijack,
             #[cfg(not(target_os = "windows"))]
@@ -211,6 +217,16 @@ impl Vm {
     /// Sentinel value `i32::MAX` means "not yet set".
     pub fn exit_code(&self) -> Arc<AtomicI32> {
         Arc::clone(&self.exit_code)
+    }
+
+    /// Get this VM's process-unique guest vsock Context Identifier.
+    ///
+    /// Resolved once during [`VmBuilder::build()`](super::builder::VmBuilder::build):
+    /// either auto-allocated from the process-global CID space or pinned via
+    /// the vsock builder override. The vsock device (when attached) uses this
+    /// CID as its guest address.
+    pub fn guest_cid(&self) -> u32 {
+        self.guest_cid
     }
 
     /// Get a cloneable handle for VM metrics.
@@ -440,7 +456,7 @@ impl Vm {
 
         let vsock_config = VsockDeviceConfig {
             vsock_id: "vsock0".to_string(),
-            guest_cid: 3,
+            guest_cid: self.guest_cid,
             host_port_map: self.vsock_host_port_map.take(),
             unix_ipc_port_map: self.vsock_unix_ipc_port_map.take(),
             custom_port_map: self.vsock_custom_port_map.take(),
@@ -464,7 +480,7 @@ impl Vm {
         self.vmr
             .set_vsock_device(VsockDeviceConfig {
                 vsock_id: "vsock0".to_string(),
-                guest_cid: 3,
+                guest_cid: self.guest_cid,
                 host_port_map: None,
                 unix_ipc_port_map: None,
                 custom_port_map: self.vsock_custom_port_map.take(),
@@ -698,6 +714,9 @@ mod tests {
             None,
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),
+            // Unit-test Vm instances bypass VmBuilder::build(), which owns CID
+            // resolution; a fixed value is sufficient here.
+            3,
             #[cfg(not(target_os = "windows"))]
             false,
             #[cfg(not(target_os = "windows"))]
@@ -727,6 +746,8 @@ mod tests {
             None,
             EventFd::new(EFD_NONBLOCK).unwrap(),
             Arc::new(AtomicI32::new(i32::MAX)),
+            // See make_vm(): direct Vm::new() callers supply their own CID.
+            3,
             enable_inet_hijack,
             None,
             None,
