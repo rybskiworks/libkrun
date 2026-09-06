@@ -47,14 +47,14 @@ jobs:
       - name: Install additional packages
         run: sudo apt-get install -y --no-install-recommends build-essential patchelf pkg-config net-tools
       
+      # Pinned to v5.0.0 (last pinned before 22ac16c3 switched to latest; ABI .so.5 matches src/libkrun/src/lib.rs). Long-term fix is the flake (N3).
       - name: Install libkrunfw
         env:
-          GH_TOKEN: ${{ github.token }}
+          LIBKRUNFW_VERSION: "5.0.0"
         run: |
-          TAG=$(gh api repos/containers/libkrunfw/releases/latest --jq '.tag_name')
-          curl -L -o /tmp/libkrunfw-x86_64.tgz "https://github.com/containers/libkrunfw/releases/download/$TAG/libkrunfw-x86_64.tgz"
+          curl -L -o /tmp/libkrunfw-5.0.0-x86_64.tgz "https://github.com/containers/libkrunfw/releases/download/v5.0.0/libkrunfw-5.0.0-x86_64.tgz"
           mkdir tmp
-          tar xf /tmp/libkrunfw-x86_64.tgz -C tmp
+          tar xf /tmp/libkrunfw-5.0.0-x86_64.tgz -C tmp
           sudo mv tmp/lib64/* /lib/x86_64-linux-gnu
       
       - name: Integration tests
