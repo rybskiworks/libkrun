@@ -106,8 +106,7 @@ pub fn allocate_guest_cid() -> Result<u32> {
     loop {
         let cid = NEXT_GUEST_CID.load(Ordering::Relaxed);
         if cid < FIRST_GUEST_CID {
-            // Counter wrapped past u32::MAX into the reserved range, which we
-            // use as the exhausted sentinel (see below).
+            // Counter wrapped into reserved range (<3): treat as exhausted.
             return Err(VsockConfigError::GuestCidExhausted);
         }
         // Claim `cid`; on wrap, park the counter on the 0 sentinel so later
@@ -120,8 +119,7 @@ pub fn allocate_guest_cid() -> Result<u32> {
             continue;
         }
         if guard.contains(&cid) {
-            // Explicitly reserved ahead of the counter; burn the value and
-            // move on. The space is huge, reuse is not worth the bookkeeping.
+            // Explicitly reserved ahead of counter; skip it and continue.
             continue;
         }
         guard.insert(cid);

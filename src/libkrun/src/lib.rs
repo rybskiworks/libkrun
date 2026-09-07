@@ -592,10 +592,7 @@ pub extern "C" fn krun_create_ctx() -> i32 {
         None
     };
 
-    // Allocate the guest CID eagerly so every context owns a process-unique
-    // vsock identity from birth, even if vsock ends up disabled (wasted CIDs
-    // are fine; the space is huge). Exhaustion is practically impossible, but
-    // fails closed with a negative errno instead of a context id.
+    // Allocate eagerly so every ctx owns unique identity from birth, even if vsock disabled. Exhaustion fails closed with errno.
     let guest_cid = match allocate_guest_cid() {
         Ok(cid) => cid,
         Err(e) => {
@@ -3146,11 +3143,9 @@ mod tests {
 
         let other_ctx = krun_create_ctx();
         assert!(other_ctx >= 0);
-        // Collision with the first context's pin must fail, not reuse.
         assert_eq!(krun_set_guest_cid(other_ctx as u32, pinned), -libc::EEXIST);
-        // Reserved host CID must fail.
         assert_eq!(krun_set_guest_cid(other_ctx as u32, 2), -libc::EINVAL);
-        // Unknown context must fail (its reservation is wasted, harmless).
+        // Reservation for unknown ctx wasted but harmless.
         let stray = allocate_guest_cid()
             .expect("CID space must not exhaust in tests")
             .wrapping_add(1 << 20)
