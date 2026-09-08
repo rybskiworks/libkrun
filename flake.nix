@@ -1,4 +1,7 @@
 # DRAFT — unvalidated (no nix in authoring env); validate with nix flake check + nix build on a nix host
+# Vendored sources (vendor/, 216 crates, ~424M) are a fork-local hermeticity workaround;
+# upstream this should use rustPlatform.buildRustPackage or crane with cargoLock
+# for fixed-output dependency fetching.
 {
   description = "libkrun — microVM API as a shared library (nix draft)";
 
@@ -76,6 +79,7 @@
             buildPhase = ''
               runHook preBuild
               export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+              export CARGO_TARGET_DIR="$TMPDIR/target"
               # Default features only (minimal). SEV/TDX/EFI/GPU/SND/INPUT/BLK/NET/
               # TIMESYNC/AWS_NITRO flags rename artifacts (VARIANT) and are out of
               # scope for the draft package.
@@ -87,7 +91,7 @@
             installPhase = ''
               runHook preInstall
               mkdir -p $out/lib
-              install -m 755 target/release/libkrun.so.${fullVersion} $out/lib/
+              install -m 755 "$CARGO_TARGET_DIR/release/libkrun.so.${fullVersion}" $out/lib/
               ln -s libkrun.so.${fullVersion} $out/lib/libkrun.so.${abiVersion}
               ln -s libkrun.so.${abiVersion} $out/lib/libkrun.so
               runHook postInstall
@@ -156,6 +160,7 @@
                 mkdir -p $out
                 cd $src
                 export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+                export CARGO_TARGET_DIR="$TMPDIR/target"
                 cargo test -p msb_krun --lib
                 touch $out/ok
               '';
