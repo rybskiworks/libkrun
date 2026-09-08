@@ -63,7 +63,7 @@
               ++ (with pkgs; [
                 gcc
                 gnumake
-                pkgconfig
+                pkg-config
                 patchelf
               ]);
 
@@ -105,7 +105,7 @@
                 pkgs.clang
                 pkgs.llvmPackages.libclang
                 pkgs.libcap_ng
-                pkgs.pkgconfig
+                pkgs.pkg-config
                 pkgs.gnumake
                 pkgs.gcc
                 pkgs.glibc.static
@@ -146,7 +146,7 @@
                   rustNative
                   ++ (with pkgs; [
                     gcc
-                    pkgconfig
+                    pkg-config
                     libcap_ng
                     clang
                     llvmPackages.libclang
