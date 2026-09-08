@@ -1,0 +1,27 @@
+[package]
+name = "kbs-types"
+description = "Rust (de)serializable types for KBS"
+version = "0.13.0"
+authors = ["Sergio Lopez <slp@redhat.com>"]
+edition = "2021"
+repository = "https://github.com/virtee/kbs-types"
+license = "Apache-2.0"
+
+[features]
+default = [ "std" ]
+alloc = ["base64/alloc",  "serde/alloc", "serde_json/alloc" ]
+std = ["base64/std", "serde/std", "serde_json/std", "thiserror/std"]
+
+[dependencies]
+base64 = { version = "0.22.1", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false }
+sha2 = "0.10"
+sm3 = "0.4.2"
+strum = { version = "0.27", features = ["derive"] }
+thiserror = { version = "2.0.3", default-features = false }
+
+[dev-dependencies]
+codicon = "3.0.0"
+curl = "0.4"
+procfs = "0.15"
