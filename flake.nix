@@ -38,11 +38,12 @@
         let
           pkgs = import inputs.nixpkgs { inherit system; };
 
-          # Toolchain (DRAFT): workestrate pins rust via fenix (fa09e647..., rustc 1.97.1,
-          # owned pin shared with nix-tooling); tooling exposes only tombi + devenvModules
-          # (no rust toolchain at inputs.tooling.packages.${system}), so this draft falls
-          # back to pkgs cargo/rustc/rustfmt. Pin via fenix on a nix host if reproducibility needs it.
-          rustNative = with pkgs; [
+          # Toolchain uses stdenv-wrapped rust: bare pkgs.cargo/pkgs.rustc lack
+          # the stdenv cc-wrapper so build scripts (nix, bindgen) fail linking
+          # (__tls_get_addr undefined / DSO missing ld-linux-x86-64.so.2);
+          # rustPlatform.rust.* wraps the cc-wrapper so NIX_LDFLAGS/rpath
+          # handling flows through cargo->cc.
+          rustNative = with pkgs.rustPlatform.rust; [
             cargo
             rustc
             rustfmt
@@ -64,7 +65,6 @@
             nativeBuildInputs =
               rustNative
               ++ (with pkgs; [
-                gcc
                 gnumake
                 pkg-config
                 patchelf
@@ -111,7 +111,6 @@
                 pkgs.libcap_ng
                 pkgs.pkg-config
                 pkgs.gnumake
-                pkgs.gcc
                 pkgs.glibc.static
                 pkgs.patchelf
               ];
@@ -149,7 +148,6 @@
                 nativeBuildInputs =
                   rustNative
                   ++ (with pkgs; [
-                    gcc
                     pkg-config
                     libcap_ng
                     clang
