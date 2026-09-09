@@ -1,95 +1,116 @@
-# DRAFT — unvalidated (no nix in authoring env); validate with nix flake check + nix build on a nix host
 {
-  description = "libkrun — microVM API as a shared library (nix draft)";
+  description = "libkrun — microVM API as a shared library";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/a799d3e3886da994fa307f817a6bc705ae538eeb";
+    tooling.url = "github:rybskiworks/nix-tooling/eae927a0da5fd04d2dfd2e7876042c6243adba65";
+    nixpkgs.follows = "tooling/nixpkgs";
+    flake-parts.follows = "tooling/flake-parts";
 
-    # Shared tooling pin (mirrors workestrate); follows the consumer nixpkgs.
-    tooling = {
-      url = "github:rybskiworks/nix-tooling/18f8b85f6777240a0ecef4e93ebee69313802aed";
-      inputs.nixpkgs.follows = "nixpkgs";
+    devenv.follows = "tooling/devenv";
+    treefmt-nix.follows = "tooling/treefmt-nix";
+    git-hooks.follows = "tooling/git-hooks";
+    devenv-root = {
+      url = "file+file:///dev/null";
+      flake = false;
     };
 
-    flake-parts = {
-      url = "github:hercules-ci/flake-parts/9d0d87172c374f89da73c1cfe6d81ae62feac1f1";
-      inputs.nixpkgs-lib.follows = "nixpkgs";
-    };
-
-    # DRAFT: libkrunfw flake is itself a DRAFT; input accepted for checks/devshell
-    # (LD_LIBRARY_PATH). Integration/VM-booting checks need it and stay in CI.
+    # Firmware is supplied to the C API through the development shell's loader path.
     libkrunfw = {
-      url = "github:rybskiworks/libkrunfw";
+      url = "github:rybskiworks/libkrunfw/dde01516aa27d46903d769c10e66c1e51e1fe117";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-parts.follows = "flake-parts";
+      inputs.tooling.follows = "tooling";
     };
   };
 
   outputs =
     inputs@{ flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [ inputs.devenv.flakeModule ];
       systems = [ "x86_64-linux" ];
 
       perSystem =
         { system, ... }:
         let
-          pkgs = import inputs.nixpkgs { inherit system; };
+          pkgs = import inputs.nixpkgs {
+            inherit system;
+            overlays = [ inputs.tooling.inputs.fenix.overlays.default ];
+          };
 
-          # Toolchain (DRAFT): workestrate pins rust via fenix (fa09e647..., rustc 1.97.1,
-          # owned pin shared with nix-tooling); tooling exposes only tombi + devenvModules
-          # (no rust toolchain at inputs.tooling.packages.${system}), so this draft falls
-          # back to pkgs cargo/rustc/rustfmt. Pin via fenix on a nix host if reproducibility needs it.
-          rustNative = with pkgs; [
+          # Use the shared Rust pin with the stdenv cc-wrapper.
+          # Do not add bare gcc here: it shadows the stdenv cc-wrapper and
+          # breaks build-script linking.
+          rustNative = with pkgs.fenix.stable; [
             cargo
             rustc
             rustfmt
           ];
 
-          # FULL_VERSION / ABI_VERSION mirror the Makefile (1.17.3 / 1).
-          fullVersion = "1.17.3";
-          abiVersion = "1";
+          rustPlatform = pkgs.makeRustPlatform {
+            inherit (pkgs.fenix.stable) cargo rustc;
+          };
+          cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+          initLdflags = "-L${pkgs.glibc.static}/lib";
+          # Bindgen loads the pinned libclang from LIBCLANG_PATH at build time.
+          cargoFlags = "--locked --offline --features msb_krun_input/bindgen_clang_runtime";
 
-          # DRAFT: libkrunfw flake is a DRAFT; direct reference is accepted for
-          # checks/devshell (LD_LIBRARY_PATH). Integration/VM-booting checks need it.
+          # FULL_VERSION mirrors the Makefile.
+          fullVersion = "1.17.3";
+
           libkrunfwLib = inputs.libkrunfw.packages.${system}.default;
+
+          source = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./Makefile
+              ./libkrun.pc.in
+              ./include
+              ./init
+              ./src
+              ./examples/rust_vm
+            ];
+          };
 
           libkrun = pkgs.stdenv.mkDerivation {
             pname = "libkrun";
             version = fullVersion;
-            src = ./.;
+            src = source;
+            inherit cargoDeps;
 
             nativeBuildInputs =
               rustNative
+              ++ [
+                rustPlatform.cargoSetupHook
+                rustPlatform.bindgenHook
+              ]
               ++ (with pkgs; [
-                gcc
                 gnumake
-                pkgconfig
+                pkg-config
                 patchelf
               ]);
 
-            buildInputs = with pkgs; [
-              libcap_ng
-              llvmPackages.libclang
-              glibc.static
-            ];
+            buildInputs = [ pkgs.libcap_ng ];
+            # Keep the Nix linker wrapper in the link path so it records library rpaths.
+            env.RUSTFLAGS = "-C linker-features=-lld";
 
             buildPhase = ''
               runHook preBuild
               export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+              export CARGO_TARGET_DIR="$TMPDIR/target"
+              export CARGO_HOME="$TMPDIR/cargo-home"
+              mkdir -p "$CARGO_HOME"
               # Default features only (minimal). SEV/TDX/EFI/GPU/SND/INPUT/BLK/NET/
               # TIMESYNC/AWS_NITRO flags rename artifacts (VARIANT) and are out of
-              # scope for the draft package.
-              make -j$NIX_BUILD_CORES
+              # scope for this package.
+              make -j$NIX_BUILD_CORES CARGO_FLAGS="${cargoFlags}" INIT_LDFLAGS="${initLdflags}" PREFIX="$out" LIBDIR_Linux=lib
               runHook postBuild
             '';
 
-            # DRAFT — unvalidated: cdylib via the repo's make; soname symlinks mirror `make install`.
             installPhase = ''
               runHook preInstall
-              mkdir -p $out/lib
-              install -m 755 target/release/libkrun.so.${fullVersion} $out/lib/
-              ln -s libkrun.so.${fullVersion} $out/lib/libkrun.so.${abiVersion}
-              ln -s libkrun.so.${abiVersion} $out/lib/libkrun.so
+              make install PREFIX="$out" LIBDIR_Linux=lib
               runHook postInstall
             '';
           };
@@ -98,67 +119,86 @@
           packages.libkrun = libkrun;
           packages.default = libkrun;
 
-          devShells.default = pkgs.mkShell {
-            packages =
-              rustNative
-              ++ [
-                pkgs.clang
-                pkgs.llvmPackages.libclang
-                pkgs.libcap_ng
-                pkgs.pkgconfig
-                pkgs.gnumake
-                pkgs.gcc
-                pkgs.glibc.static
-                pkgs.patchelf
-              ];
-            shellHook = ''
+          _module.args.pkgs = pkgs;
+
+          devenv.shells.default = {
+            containers = pkgs.lib.mkForce { };
+            imports = [
+              inputs.tooling.devenvModules.base
+              inputs.tooling.devenvModules.nix
+              inputs.tooling.devenvModules.rust
+            ];
+            treefmt.config.programs.rustfmt.edition = "2021";
+            packages = rustNative ++ [
+              pkgs.clang
+              pkgs.llvmPackages.libclang
+              pkgs.libcap_ng
+              pkgs.pkg-config
+              pkgs.gnumake
+              pkgs.patchelf
+            ];
+            env.INIT_LDFLAGS = initLdflags;
+            # Interactive Cargo uses its ordinary cache and may fetch dependencies.
+            # Sandboxed package/check builds keep the locked, offline flags above.
+            env.CARGO_FLAGS = "--locked --features msb_krun_input/bindgen_clang_runtime";
+            env.RUSTFLAGS = "-C linker-features=-lld";
+            enterShell = ''
               export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
               export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.glibc.dev}/include"
-              # DRAFT: libkrunfw flake is itself a DRAFT; input accepted for checks/devshell
-              # (LD_LIBRARY_PATH). Integration/VM-booting checks need it and stay in CI.
               export LD_LIBRARY_PATH="${libkrunfwLib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-              echo "libkrun nix draft shell (unvalidated — see flake.nix header)"
             '';
           };
 
           checks = {
-            fmt = pkgs.runCommand "libkrun-fmt-check"
-              {
-                src = ./.;
-                nativeBuildInputs = rustNative;
-              }
-              ''
-                mkdir -p $out
-                cd $src
-                cargo fmt --check
-                touch $out/ok
-              '';
+            c-sdk =
+              pkgs.runCommandCC "libkrun-c-sdk-check"
+                {
+                  nativeBuildInputs = [ pkgs.pkg-config ];
+                  buildInputs = [ libkrun ];
+                }
+                ''
+                  $CC ${./tests/c-sdk-smoke.c} $(pkg-config --cflags --libs libkrun) -o c-sdk-smoke
+                  ./c-sdk-smoke
+                  mkdir -p $out
+                  touch $out/ok
+                '';
 
-            # Unit scope (DRAFT): only workspace unit tests that don't need KVM
+            fmt =
+              pkgs.runCommand "libkrun-fmt-check"
+                {
+                  src = source;
+                  nativeBuildInputs = rustNative;
+                }
+                ''
+                  mkdir -p $out
+                  cd $src
+                  cargo fmt --check
+                  touch $out/ok
+                '';
+
+            # Unit scope: only workspace unit tests that don't need KVM
             # (e.g. `cargo test -p msb_krun --lib` builder validation).
             # KVM/VM-booting tests are excluded from nix checks and rely on CI.
             # Clippy stays advisory in CI (ci-advisory owns it); deliberately NOT
             # a nix check (nix checks have no continue-on-error).
-            unit-msb-krun = pkgs.runCommand "libkrun-unit-msb-krun"
-              {
-                src = ./.;
-                nativeBuildInputs =
-                  rustNative
-                  ++ (with pkgs; [
-                    gcc
-                    pkgconfig
-                    libcap_ng
-                    clang
-                    llvmPackages.libclang
-                  ]);
-              }
-              ''
-                mkdir -p $out
-                cd $src
+            unit-msb-krun = libkrun.overrideAttrs {
+              pname = "libkrun-unit-msb-krun";
+              buildPhase = ''
+                runHook preBuild
                 export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-                cargo test -p msb_krun --lib
+                export CARGO_TARGET_DIR="$TMPDIR/target"
+                export CARGO_HOME="$TMPDIR/cargo-home"
+                mkdir -p "$CARGO_HOME"
+                make init/init INIT_LDFLAGS="${initLdflags}"
+                cargo test --locked --offline -p msb_krun --lib
+                cargo test --locked --offline -p msb_krun --lib --features net
+                runHook postBuild
+              '';
+              installPhase = ''
+                mkdir -p $out
                 touch $out/ok
               '';
+            };
           };
         };
     };

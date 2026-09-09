@@ -105,6 +105,44 @@ When TSI is enabled, the VMM acts as a proxy for AF_INET, AF_INET6 and AF_UNIX s
 
 ## Building and installing
 
+### Nix (x86_64 Linux)
+
+The default package builds the generic shared library with the shared pinned Rust
+toolchain and locked, offline Cargo dependencies fetched by Nix from `Cargo.lock`.
+Nix stages its own dependency directory from `Cargo.lock`; no checked-in vendor
+tree or repository-wide Cargo source redirection is required. It installs the
+public headers and `libkrun.pc` alongside the library.
+
+```sh
+nix build .#libkrun
+nix build .#checks.x86_64-linux.unit-msb-krun .#checks.x86_64-linux.c-sdk
+```
+
+The unit check rebuilds the guest init executable and tests the Rust API with both
+the default and `net` features. The C SDK check compiles and runs a context
+creation/destruction consumer against the installed headers and library. Neither
+check boots a VM; C API VM launches also need `libkrunfw.so.5` on the loader path.
+
+The development shell uses the shared `nix-tooling` devenv modules. Pure shell
+evaluation needs a file containing the writable checkout path:
+
+```sh
+mkdir -p .devenv
+printf '%s' "$(pwd -P)" > .devenv/root
+nix develop --override-input devenv-root "file+file://$PWD/.devenv/root"
+```
+
+The shell supplies the firmware loader path. The same root override is required
+when evaluating the complete flake, including devenv's shell checks.
+
+Native Make builds also honor `CARGO_TARGET_DIR` and `CARGO_FLAGS`. Interactive
+shell builds use locked dependencies through Cargo's ordinary cache and may
+fetch missing dependencies; use `--offline` explicitly only after populating
+that cache. Nix package and check builds always use `--locked --offline` with
+dependencies staged by Nix.
+`INIT_LDFLAGS` supplies linker flags for the static guest init only. The Nix shell
+uses it to keep static glibc out of the host Rust linker's search path.
+
 ### Linux (generic variant)
 
 #### Requirements
