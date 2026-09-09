@@ -37,6 +37,7 @@ AWS_NITRO_INIT_LD_FLAGS = -larchive -lnsm
 
 BUILD_INIT = 1
 INIT_DEFS =
+INIT_LDFLAGS ?=
 ifeq ($(SEV),1)
     VARIANT = -sev
     FEATURE_FLAGS := --features amd-sev
@@ -99,10 +100,13 @@ KRUN_BINARY_Darwin = libkrun$(VARIANT).$(FULL_VERSION).dylib
 KRUN_SONAME_Darwin = libkrun$(VARIANT).$(ABI_VERSION).dylib
 KRUN_BASE_Darwin = libkrun$(VARIANT).dylib
 
-LIBRARY_RELEASE_Linux = target/release/$(KRUN_BINARY_Linux)
-LIBRARY_DEBUG_Linux = target/debug/$(KRUN_BINARY_Linux)
-LIBRARY_RELEASE_Darwin = target/release/$(KRUN_BINARY_Darwin)
-LIBRARY_DEBUG_Darwin = target/debug/$(KRUN_BINARY_Darwin)
+export CARGO_TARGET_DIR ?= target
+CARGO_FLAGS ?=
+
+LIBRARY_RELEASE_Linux = $(CARGO_TARGET_DIR)/release/$(KRUN_BINARY_Linux)
+LIBRARY_DEBUG_Linux = $(CARGO_TARGET_DIR)/debug/$(KRUN_BINARY_Linux)
+LIBRARY_RELEASE_Darwin = $(CARGO_TARGET_DIR)/release/$(KRUN_BINARY_Darwin)
+LIBRARY_DEBUG_Darwin = $(CARGO_TARGET_DIR)/debug/$(KRUN_BINARY_Darwin)
 
 LIBDIR_Linux = lib64
 LIBDIR_Darwin = lib
@@ -136,7 +140,7 @@ endif
 ifeq ($(BUILD_INIT),1)
 INIT_BINARY = init/init
 $(INIT_BINARY): $(INIT_SRC) $(SYSROOT_TARGET)
-	$(CC_LINUX) -O2 -static -Wall $(INIT_DEFS) -o $@ $(INIT_SRC) $(INIT_DEFS)
+	$(CC_LINUX) -O2 -static -Wall $(INIT_DEFS) -o $@ $(INIT_SRC) $(INIT_DEFS) $(INIT_LDFLAGS)
 	cp $@ src/devices/init
 endif
 
@@ -177,33 +181,33 @@ clean-sysroot:
 
 
 $(LIBRARY_RELEASE_$(OS)): $(INIT_BINARY)
-	cargo build --release $(FEATURE_FLAGS)
+	cargo build --release $(CARGO_FLAGS) $(FEATURE_FLAGS)
 ifeq ($(SEV),1)
-	mv target/release/libkrun.so target/release/$(KRUN_BASE_$(OS))
+	mv $(CARGO_TARGET_DIR)/release/libkrun.so $(CARGO_TARGET_DIR)/release/$(KRUN_BASE_$(OS))
 endif
 ifeq ($(AWS_NITRO),1)
-	mv target/release/libkrun.so target/release/$(KRUN_BASE_$(OS))
+	mv $(CARGO_TARGET_DIR)/release/libkrun.so $(CARGO_TARGET_DIR)/release/$(KRUN_BASE_$(OS))
 endif
 ifeq ($(TDX),1)
-	mv target/release/libkrun.so target/release/$(KRUN_BASE_$(OS))
+	mv $(CARGO_TARGET_DIR)/release/libkrun.so $(CARGO_TARGET_DIR)/release/$(KRUN_BASE_$(OS))
 endif
 ifeq ($(OS),Darwin)
 ifeq ($(EFI),1)
-	install_name_tool -id $(PREFIX)/$(LIBDIR_$(OS))/$(KRUN_SONAME_$(OS)) target/release/libkrun.dylib
+	install_name_tool -id $(PREFIX)/$(LIBDIR_$(OS))/$(KRUN_SONAME_$(OS)) $(CARGO_TARGET_DIR)/release/libkrun.dylib
 endif
-	mv target/release/libkrun.dylib target/release/$(KRUN_BASE_$(OS))
+	mv $(CARGO_TARGET_DIR)/release/libkrun.dylib $(CARGO_TARGET_DIR)/release/$(KRUN_BASE_$(OS))
 endif
-	cp target/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
+	cp $(CARGO_TARGET_DIR)/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
 
 $(LIBRARY_DEBUG_$(OS)): $(INIT_BINARY)
-	cargo build $(FEATURE_FLAGS)
+	cargo build $(CARGO_FLAGS) $(FEATURE_FLAGS)
 ifeq ($(SEV),1)
-	mv target/debug/libkrun.so target/debug/$(KRUN_BASE_$(OS))
+	mv $(CARGO_TARGET_DIR)/debug/libkrun.so $(CARGO_TARGET_DIR)/debug/$(KRUN_BASE_$(OS))
 endif
 ifeq ($(TDX),1)
-	mv target/debug/libkrun.so target/debug/$(KRUN_BASE_$(OS))
+	mv $(CARGO_TARGET_DIR)/debug/libkrun.so $(CARGO_TARGET_DIR)/debug/$(KRUN_BASE_$(OS))
 endif
-	cp target/debug/$(KRUN_BASE_$(OS)) $(LIBRARY_DEBUG_$(OS))
+	cp $(CARGO_TARGET_DIR)/debug/$(KRUN_BASE_$(OS)) $(LIBRARY_DEBUG_$(OS))
 
 libkrun.pc: libkrun.pc.in Makefile
 	rm -f $@ $@-t
