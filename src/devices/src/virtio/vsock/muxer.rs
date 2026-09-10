@@ -727,7 +727,7 @@ impl VsockMuxer {
             }
         };
         let peer = VsockDatagramPeer {
-            guest_cid: pkt.src_cid(),
+            guest_cid: self.cid,
             guest_port: pkt.src_port(),
             host_port: pkt.dst_port(),
         };
@@ -809,8 +809,8 @@ impl VsockMuxer {
             pkt.dst_port()
         );
 
-        if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
-            debug!("dropping guest packet for unknown CID: {:?}", pkt.hdr());
+        if pkt.src_cid() != self.cid || pkt.dst_cid() != uapi::VSOCK_HOST_CID {
+            debug!("dropping guest packet with invalid CIDs: {:?}", pkt.hdr());
             return Ok(());
         }
 
@@ -885,7 +885,7 @@ impl VsockMuxer {
             .cloned()
         {
             let request = VsockConnectRequest {
-                guest_cid: pkt.src_cid(),
+                guest_cid: self.cid,
                 guest_port: pkt.src_port(),
                 host_port: pkt.dst_port(),
             };
@@ -1221,8 +1221,8 @@ impl VsockMuxer {
             pkt.op()
         );
 
-        if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
-            debug!("dropping guest packet for unknown CID: {:?}", pkt.hdr());
+        if pkt.src_cid() != self.cid || pkt.dst_cid() != uapi::VSOCK_HOST_CID {
+            debug!("dropping guest packet with invalid CIDs: {:?}", pkt.hdr());
             return Ok(());
         }
 
@@ -1245,7 +1245,189 @@ impl VsockMuxer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::packet::VSOCK_PKT_HDR_SIZE;
+    use super::super::{VsockDatagramBackend, VsockStreamBackend};
     use super::*;
+    use crate::virtio::{Descriptor, DescriptorChain};
+    use std::io;
+    use vm_memory::{Bytes, GuestAddress};
+
+    const TEST_CID: u64 = 42;
+    const TEST_PORT: u32 = 5000;
+    const HEADER: GuestAddress = GuestAddress(0x2000);
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        streams: Mutex<Vec<VsockConnectRequest>>,
+        datagrams: Mutex<Vec<VsockDatagramPeer>>,
+    }
+
+    impl VsockPortBackend for RecordingBackend {
+        fn connect(
+            &self,
+            request: VsockConnectRequest,
+            _notifier: VsockNotifier,
+        ) -> io::Result<Box<dyn VsockStreamBackend>> {
+            self.streams.lock().unwrap().push(request);
+            Err(io::ErrorKind::ConnectionRefused.into())
+        }
+    }
+
+    impl VsockDatagramPortBackend for RecordingBackend {
+        fn open_peer(
+            &self,
+            peer: VsockDatagramPeer,
+            _notifier: VsockNotifier,
+        ) -> io::Result<Box<dyn VsockDatagramBackend>> {
+            self.datagrams.lock().unwrap().push(peer);
+            Err(io::ErrorKind::ConnectionRefused.into())
+        }
+    }
+
+    fn test_muxer(mem: &GuestMemoryMmap, backend: &Arc<RecordingBackend>) -> VsockMuxer {
+        let mut muxer = VsockMuxer::new(
+            TEST_CID,
+            None,
+            None,
+            Some(HashMap::from([(
+                TEST_PORT,
+                backend.clone() as Arc<dyn VsockPortBackend>,
+            )])),
+            Some(HashMap::from([(
+                TEST_PORT,
+                backend.clone() as Arc<dyn VsockDatagramPortBackend>,
+            )])),
+            TsiFlags::empty(),
+        );
+        muxer.mem = Some(mem.clone());
+        muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(256))));
+        muxer
+    }
+
+    fn tx_packet(mem: &GuestMemoryMmap, src_cid: u64, dst_cid: u64, op: u16) -> VsockPacket {
+        let table = GuestAddress(0x1000);
+        mem.write_obj(
+            Descriptor {
+                addr: HEADER.0,
+                len: VSOCK_PKT_HDR_SIZE as u32,
+                flags: 0,
+                next: 0,
+            },
+            table,
+        )
+        .unwrap();
+        let mut header = [0; VSOCK_PKT_HDR_SIZE];
+        header[0..8].copy_from_slice(&src_cid.to_le_bytes());
+        header[8..16].copy_from_slice(&dst_cid.to_le_bytes());
+        header[16..20].copy_from_slice(&4000u32.to_le_bytes());
+        header[20..24].copy_from_slice(&TEST_PORT.to_le_bytes());
+        header[30..32].copy_from_slice(&op.to_le_bytes());
+        mem.write_slice(&header, HEADER).unwrap();
+        let head = DescriptorChain::checked_new(mem, table, 1, 0).unwrap();
+        VsockPacket::from_tx_virtq_head(&head).unwrap()
+    }
+
+    #[test]
+    fn foreign_cids_never_reach_stream_or_datagram_backends() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let backend = Arc::new(RecordingBackend::default());
+        let mut muxer = test_muxer(&mem, &backend);
+        for cid in [
+            0,
+            1,
+            2,
+            3,
+            TEST_CID - 1,
+            TEST_CID + 1,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
+            for op in 0..=uapi::VSOCK_OP_CREDIT_UPDATE {
+                let pkt = tx_packet(&mem, cid, uapi::VSOCK_HOST_CID, op);
+                muxer.send_stream_pkt(&pkt).unwrap();
+                muxer.send_dgram_pkt(&pkt).unwrap();
+            }
+        }
+        assert!(backend.streams.lock().unwrap().is_empty());
+        assert!(backend.datagrams.lock().unwrap().is_empty());
+        assert!(muxer.rxq.lock().unwrap().is_empty());
+        assert!(muxer.proxy_map.read().unwrap().is_empty());
+        assert!(muxer.dgram_peer_map.lock().unwrap().is_empty());
+
+        // A rejected packet does not poison the next valid connection.
+        let request = tx_packet(&mem, TEST_CID, uapi::VSOCK_HOST_CID, uapi::VSOCK_OP_REQUEST);
+        muxer.send_stream_pkt(&request).unwrap();
+        let datagram = tx_packet(&mem, TEST_CID, uapi::VSOCK_HOST_CID, uapi::VSOCK_OP_RW);
+        muxer.send_dgram_pkt(&datagram).unwrap();
+        assert_eq!(
+            *backend.streams.lock().unwrap(),
+            vec![VsockConnectRequest {
+                guest_cid: TEST_CID,
+                guest_port: 4000,
+                host_port: TEST_PORT,
+            }]
+        );
+        assert_eq!(
+            *backend.datagrams.lock().unwrap(),
+            vec![VsockDatagramPeer {
+                guest_cid: TEST_CID,
+                guest_port: 4000,
+                host_port: TEST_PORT,
+            }]
+        );
+    }
+
+    #[test]
+    fn changed_guest_headers_cannot_retarget_accepted_packets() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let backend = Arc::new(RecordingBackend::default());
+        let mut muxer = test_muxer(&mem, &backend);
+        for op in [uapi::VSOCK_OP_REQUEST, uapi::VSOCK_OP_RW] {
+            let pkt = tx_packet(&mem, TEST_CID, uapi::VSOCK_HOST_CID, op);
+            mem.write_slice(&[0xff; VSOCK_PKT_HDR_SIZE], HEADER)
+                .unwrap();
+            if op == uapi::VSOCK_OP_REQUEST {
+                muxer.send_stream_pkt(&pkt).unwrap();
+            } else {
+                muxer.send_dgram_pkt(&pkt).unwrap();
+            }
+        }
+        let streams = backend.streams.lock().unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(
+            streams[0],
+            VsockConnectRequest {
+                guest_cid: TEST_CID,
+                guest_port: 4000,
+                host_port: TEST_PORT,
+            }
+        );
+        let datagrams = backend.datagrams.lock().unwrap();
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(
+            datagrams[0],
+            VsockDatagramPeer {
+                guest_cid: TEST_CID,
+                guest_port: 4000,
+                host_port: TEST_PORT,
+            }
+        );
+    }
+
+    #[test]
+    fn non_host_destinations_never_reach_backends() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let backend = Arc::new(RecordingBackend::default());
+        let mut muxer = test_muxer(&mem, &backend);
+        for cid in [0, 1, 3, TEST_CID, u64::MAX] {
+            let pkt = tx_packet(&mem, TEST_CID, cid, uapi::VSOCK_OP_REQUEST);
+            muxer.send_stream_pkt(&pkt).unwrap();
+            let pkt = tx_packet(&mem, TEST_CID, cid, uapi::VSOCK_OP_RW);
+            muxer.send_dgram_pkt(&pkt).unwrap();
+        }
+        assert!(backend.streams.lock().unwrap().is_empty());
+        assert!(backend.datagrams.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn datagram_peer_limit_evicts_the_least_recently_used_peer_per_port() {
