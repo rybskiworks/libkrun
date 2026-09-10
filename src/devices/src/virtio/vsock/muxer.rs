@@ -1343,6 +1343,8 @@ impl Drop for VsockMuxer {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::super::packet::VSOCK_PKT_HDR_SIZE;
     use super::super::{VsockDatagramBackend, VsockStreamBackend};
     use super::*;
@@ -1644,8 +1646,16 @@ mod tests {
     }
 
     fn test_muxer(mem: &GuestMemoryMmap, backend: &Arc<RecordingBackend>) -> VsockMuxer {
+        test_muxer_with_cid(mem, backend, TEST_CID)
+    }
+
+    fn test_muxer_with_cid(
+        mem: &GuestMemoryMmap,
+        backend: &Arc<RecordingBackend>,
+        cid: u64,
+    ) -> VsockMuxer {
         let mut muxer = VsockMuxer::new(
-            TEST_CID,
+            cid,
             None,
             None,
             Some(HashMap::from([(
@@ -1662,6 +1672,42 @@ mod tests {
         muxer.mem = Some(mem.clone());
         muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(256))));
         muxer
+    }
+
+    proptest! {
+        #[test]
+        fn foreign_packet_sequences_preserve_authoritative_backend_identity(
+            cid in 3u32..u32::MAX,
+            packets in proptest::collection::vec((1u64..=u64::MAX, any::<u16>()), 1..25),
+        ) {
+            let cid = u64::from(cid);
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let backend = Arc::new(RecordingBackend::default());
+            let mut muxer = test_muxer_with_cid(&mem, &backend, cid);
+            for (difference, op) in packets {
+                // Construct an unequal identity without filtering shrunk inputs.
+                let pkt = tx_packet(&mem, cid ^ difference, uapi::VSOCK_HOST_CID, op);
+                muxer.send_stream_pkt(&pkt).unwrap();
+                muxer.send_dgram_pkt(&pkt).unwrap();
+                prop_assert!(backend.streams.lock().unwrap().is_empty());
+                prop_assert!(backend.datagrams.lock().unwrap().is_empty());
+                prop_assert!(muxer.rxq.lock().unwrap().is_empty());
+                prop_assert!(muxer.proxy_map.read().unwrap().is_empty());
+                prop_assert!(muxer.dgram_peer_map.lock().unwrap().is_empty());
+            }
+            let request = tx_packet(&mem, cid, uapi::VSOCK_HOST_CID, uapi::VSOCK_OP_REQUEST);
+            muxer.send_stream_pkt(&request).unwrap();
+            let datagram = tx_packet(&mem, cid, uapi::VSOCK_HOST_CID, uapi::VSOCK_OP_RW);
+            muxer.send_dgram_pkt(&datagram).unwrap();
+            let streams = backend.streams.lock().unwrap();
+            prop_assert_eq!(streams.as_slice(), &[VsockConnectRequest {
+                guest_cid: cid, guest_port: 4000, host_port: TEST_PORT,
+            }]);
+            let datagrams = backend.datagrams.lock().unwrap();
+            prop_assert_eq!(datagrams.as_slice(), &[VsockDatagramPeer {
+                guest_cid: cid, guest_port: 4000, host_port: TEST_PORT,
+            }]);
+        }
     }
 
     fn tx_packet(mem: &GuestMemoryMmap, src_cid: u64, dst_cid: u64, op: u16) -> VsockPacket {

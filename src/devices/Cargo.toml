@@ -62,3 +62,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Stora
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 vm-fdt = ">= 0.2.0"
+
+[dev-dependencies]
+proptest.workspace = true

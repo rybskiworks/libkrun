@@ -189,6 +189,9 @@
                 export CARGO_TARGET_DIR="$TMPDIR/target"
                 export CARGO_HOME="$TMPDIR/cargo-home"
                 export CARGO_PROFILE_TEST_DEBUG=0
+                export PROPTEST_CASES=256
+                export PROPTEST_RNG_SEED=20260910
+                export PROPTEST_MAX_SHRINK_ITERS=4096
                 mkdir -p "$CARGO_HOME"
                 make init/init INIT_LDFLAGS="${initLdflags}"
                 for scope in memory_state private_memory device_state execution_state vmm_config::vsock; do
