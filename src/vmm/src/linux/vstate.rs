@@ -6,8 +6,10 @@
 // found in the THIRD-PARTY file.
 
 #[cfg(target_arch = "aarch64")]
+use super::arm64_state;
+#[cfg(target_arch = "aarch64")]
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
 use libc::{c_int, c_void, siginfo_t};
 use std::cell::Cell;
 use std::fmt::{Display, Formatter};
@@ -20,13 +22,18 @@ use std::os::unix::io::RawFd;
 use std::env;
 use std::result;
 use std::sync::atomic::{fence, Ordering};
-#[cfg(not(test))]
-use std::sync::Barrier;
 use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
 
-use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+#[cfg(target_arch = "x86_64")]
+use serde::{Deserialize, Serialize};
+
+use super::super::{
+    VcpuControlRequestId, FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK,
+    VCPU_CONTROL_MAILBOX_CAPACITY,
+};
+use crate::memory_state::GuestMemoryRange;
 
 #[cfg(feature = "amd-sev")]
 use super::tee::amdsnp::{AmdSnp, Error as SnpError};
@@ -43,12 +50,14 @@ use crate::resources::VcpuPlacementResult;
 use crate::vmm_config::machine_config::{CpuFeaturesTemplate, HostCpuId};
 #[cfg(target_arch = "x86_64")]
 use cpuid::{c3, filter_cpuid, t2, VmSpec};
+#[cfg(not(feature = "tee"))]
+use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    kvm_clock_data, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state, kvm_pit_state2,
-    kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, CpuId, MsrList, Msrs,
-    KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_MAX_CPUID_ENTRIES,
+    kvm_clock_data, kvm_cpuid_entry2, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state,
+    kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
+    CpuId, MsrList, Msrs, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
+    KVM_IRQCHIP_PIC_SLAVE, KVM_MAX_CPUID_ENTRIES, KVM_MAX_MSR_ENTRIES,
 };
 use kvm_bindings::{
     kvm_create_guest_memfd, kvm_userspace_memory_region, kvm_userspace_memory_region2,
@@ -76,6 +85,9 @@ use super::tee::amdsnp::launch as snp;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
+
+#[cfg(target_arch = "x86_64")]
+const MSR_IA32_XSS: u32 = 0x0000_0da0;
 
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug)]
@@ -131,6 +143,14 @@ pub enum Error {
     SetMemoryAttributes(kvm_ioctls::Error),
     /// Cannot set the memory regions.
     SetUserMemoryRegion(kvm_ioctls::Error),
+    /// Cannot read a KVM dirty-memory generation.
+    GetDirtyLog(kvm_ioctls::Error),
+    /// Cannot determine the host page size used by KVM dirty logs.
+    DirtyPageSize(io::Error),
+    /// Dirty logging is unavailable for protected guest memory.
+    DirtyTrackingUnsupported,
+    /// Backend execution state could not be encoded or decoded.
+    StateCodec(String),
     /// Error creating memory map for SHM region.
     ShmMmap(io::Error),
     #[cfg(feature = "amd-sev")]
@@ -193,6 +213,8 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu xsave.
     VcpuGetXsave(kvm_ioctls::Error),
+    /// Failed to read the virtual TSC frequency.
+    VcpuGetTscKhz(kvm_ioctls::Error),
     /// Cannot run the VCPUs.
     VcpuRun(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -225,6 +247,8 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu xsave.
     VcpuSetXsave(kvm_ioctls::Error),
+    /// Failed to restore the virtual TSC frequency.
+    VcpuSetTscKhz(kvm_ioctls::Error),
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
     /// Cannot bind a vCPU thread to its resolved host logical processor.
@@ -307,6 +331,15 @@ impl Display for Error {
             ),
             SetMemoryAttributes(e) => write!(f, "Cannot set memory region attributes: {e}"),
             SetUserMemoryRegion(e) => write!(f, "Cannot set the memory regions: {e}"),
+            GetDirtyLog(e) => write!(f, "Cannot read the KVM dirty-memory log: {e}"),
+            DirtyPageSize(e) => write!(f, "Cannot determine the KVM dirty page size: {e}"),
+            DirtyTrackingUnsupported => {
+                write!(
+                    f,
+                    "KVM dirty tracking is unavailable for protected guest memory"
+                )
+            }
+            StateCodec(e) => write!(f, "KVM execution-state codec failed: {e}"),
             ShmMmap(e) => write!(f, "Error creating memory map for SHM region: {e}"),
             #[cfg(feature = "amd-sev")]
             SnpSecVirtInit(e) => write!(
@@ -378,6 +411,7 @@ impl Display for Error {
             VcpuGetXcrs(e) => write!(f, "Failed to get KVM vcpu xcrs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetXsave(e) => write!(f, "Failed to get KVM vcpu xsave: {e}"),
+            VcpuGetTscKhz(e) => write!(f, "Failed to get KVM vcpu TSC frequency: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetCpuid(e) => write!(f, "Failed to set KVM vcpu cpuid: {e}"),
             #[cfg(target_arch = "x86_64")]
@@ -398,6 +432,7 @@ impl Display for Error {
             VcpuSetXcrs(e) => write!(f, "Failed to set KVM vcpu xcrs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetXsave(e) => write!(f, "Failed to set KVM vcpu xsave: {e}"),
+            VcpuSetTscKhz(e) => write!(f, "Failed to set KVM vcpu TSC frequency: {e}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
             VcpuAffinity(e) => write!(f, "Cannot set vCPU host affinity: {e}"),
             VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
@@ -491,10 +526,23 @@ impl KvmContext {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MappedMemoryRegion {
+    slot: u32,
+    guest_addr: u64,
+    size: u64,
+    #[cfg(not(feature = "tee"))]
+    host_addr: u64,
+}
+
 /// A wrapper around creating and using a VM.
 pub struct Vm {
     fd: VmFd,
     next_mem_slot: u32,
+    memory_regions: Vec<MappedMemoryRegion>,
+    dirty_tracking: bool,
+    #[cfg(target_arch = "aarch64")]
+    paused_arm_state: Option<arm64_state::PausedState>,
 
     // X86 specific fields.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -532,6 +580,10 @@ impl Vm {
         Ok(Vm {
             fd: vm_fd,
             next_mem_slot: 0,
+            memory_regions: Vec::new(),
+            dirty_tracking: false,
+            #[cfg(target_arch = "aarch64")]
+            paused_arm_state: None,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             supported_cpuid,
             #[cfg(target_arch = "x86_64")]
@@ -571,6 +623,8 @@ impl Vm {
         Ok(Vm {
             fd: vm_fd,
             next_mem_slot: 0,
+            memory_regions: Vec::new(),
+            dirty_tracking: false,
             supported_cpuid,
             supported_msrs,
             tee,
@@ -616,6 +670,8 @@ impl Vm {
         Ok(Vm {
             fd: vm_fd,
             next_mem_slot: 0,
+            memory_regions: Vec::new(),
+            dirty_tracking: false,
             supported_cpuid,
             supported_msrs,
             tdx: Some(IntelTdx::new()),
@@ -667,6 +723,87 @@ impl Vm {
         None
     }
 
+    /// Starts a KVM CPU dirty generation for every ordinary guest-memory slot.
+    ///
+    /// The caller must hold the VM-wide paused boundary while mappings are re-registered. No work
+    /// is added to the normal vCPU or device-memory hot paths while tracking is disabled.
+    #[cfg(not(feature = "tee"))]
+    pub fn begin_dirty_tracking(&mut self) -> Result<()> {
+        if self.dirty_tracking {
+            return Ok(());
+        }
+
+        for region in &self.memory_regions {
+            self.set_memory_region_flags(region, KVM_MEM_LOG_DIRTY_PAGES)?;
+        }
+        self.dirty_tracking = true;
+        Ok(())
+    }
+
+    /// Rejects dirty tracking for protected guest memory, whose bytes are not host-readable.
+    #[cfg(feature = "tee")]
+    pub fn begin_dirty_tracking(&mut self) -> Result<()> {
+        Err(Error::DirtyTrackingUnsupported)
+    }
+
+    /// Seals the current KVM CPU dirty generation and returns coalesced GPA ranges.
+    pub fn take_dirty_ranges(&mut self) -> Result<Vec<GuestMemoryRange>> {
+        if !self.dirty_tracking {
+            return Err(Error::DirtyTrackingUnsupported);
+        }
+
+        let page_size = host_page_size()?;
+        let mut ranges = Vec::new();
+        for region in &self.memory_regions {
+            let bitmap = self
+                .fd
+                .get_dirty_log(region.slot, region.size as usize)
+                .map_err(Error::GetDirtyLog)?;
+            bitmap_to_ranges(
+                region.guest_addr,
+                region.size,
+                page_size,
+                &bitmap,
+                &mut ranges,
+            );
+        }
+        Ok(ranges)
+    }
+
+    /// Stops KVM dirty logging and restores ordinary writable memory slots.
+    #[cfg(not(feature = "tee"))]
+    pub fn stop_dirty_tracking(&mut self) -> Result<()> {
+        // Reconcile all slots even after an initial arm failed partway through.
+        for region in &self.memory_regions {
+            self.set_memory_region_flags(region, 0)?;
+        }
+        self.dirty_tracking = false;
+        Ok(())
+    }
+
+    /// Protected guest-memory tracking is never armed by this backend.
+    #[cfg(feature = "tee")]
+    pub fn stop_dirty_tracking(&mut self) -> Result<()> {
+        self.dirty_tracking = false;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "tee"))]
+    fn set_memory_region_flags(&self, region: &MappedMemoryRegion, flags: u32) -> Result<()> {
+        let memory_region = kvm_userspace_memory_region {
+            slot: region.slot,
+            guest_phys_addr: region.guest_addr,
+            memory_size: region.size,
+            userspace_addr: region.host_addr,
+            flags,
+        };
+        unsafe {
+            self.fd
+                .set_user_memory_region(memory_region)
+                .map_err(Error::SetUserMemoryRegion)
+        }
+    }
+
     #[allow(unused_mut)]
     fn memory_region_set(
         &mut self,
@@ -687,9 +824,10 @@ impl Vm {
         // as of late 2025. Also, on other architectures like aarch64, guest_memfd in
         // general is unstable for now, so don't try to use it without a reason.
 
+        let slot = self.next_mem_slot;
         if cfg!(not(feature = "tee")) {
             let memory_region = kvm_userspace_memory_region {
-                slot: self.next_mem_slot,
+                slot,
                 guest_phys_addr: start,
                 memory_size: region.len(),
                 userspace_addr: host_addr as u64,
@@ -719,7 +857,7 @@ impl Vm {
                 .map_err(Error::CreateGuestMemfd)?;
 
             let memory_region = kvm_userspace_memory_region2 {
-                slot: self.next_mem_slot,
+                slot,
                 flags: KVM_MEM_GUEST_MEMFD,
                 guest_phys_addr: start,
                 memory_size: region.len(),
@@ -751,6 +889,14 @@ impl Vm {
 
             self.guest_memfds.push((Range { start, end }, guest_memfd));
         }
+
+        self.memory_regions.push(MappedMemoryRegion {
+            slot,
+            guest_addr: start,
+            size: region.len(),
+            #[cfg(not(feature = "tee"))]
+            host_addr: host_addr as u64,
+        });
 
         self.next_mem_slot += 1;
 
@@ -837,12 +983,18 @@ impl Vm {
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     /// Saves and returns the Kvm Vm state.
-    pub fn save_state(&self) -> Result<VmState> {
-        let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
-
+    pub fn save_state(&self, split_irqchip: bool) -> Result<VmState> {
         let mut clock = self.fd.get_clock().map_err(Error::VmGetClock)?;
         // This bit is not accepted in SET_CLOCK, clear it.
-        clock.flags &= !KVM_CLOCK_TSC_STABLE;
+        // Planned interruption freezes virtual elapsed time. SET_CLOCK must not add host
+        // downtime through REALTIME; wall time is reconciled separately by kernel activation.
+        clock.flags &= !(KVM_CLOCK_TSC_STABLE | kvm_bindings::KVM_CLOCK_REALTIME);
+
+        if split_irqchip {
+            return Ok(VmState::SplitIrqchip { clock });
+        }
+
+        let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
 
         let mut pic_master = kvm_irqchip {
             chip_id: KVM_IRQCHIP_PIC_MASTER,
@@ -868,7 +1020,7 @@ impl Vm {
             .get_irqchip(&mut ioapic)
             .map_err(Error::VmGetIrqChip)?;
 
-        Ok(VmState {
+        Ok(VmState::InKernelIrqchip {
             pitstate,
             clock,
             pic_master,
@@ -880,33 +1032,203 @@ impl Vm {
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     /// Restores the Kvm Vm state.
-    pub fn restore_state(&self, state: &VmState) -> Result<()> {
-        self.fd
-            .set_pit2(&state.pitstate)
-            .map_err(Error::VmSetPit2)?;
-        self.fd.set_clock(&state.clock).map_err(Error::VmSetClock)?;
-        self.fd
-            .set_irqchip(&state.pic_master)
-            .map_err(Error::VmSetIrqChip)?;
-        self.fd
-            .set_irqchip(&state.pic_slave)
-            .map_err(Error::VmSetIrqChip)?;
-        self.fd
-            .set_irqchip(&state.ioapic)
-            .map_err(Error::VmSetIrqChip)?;
+    pub fn restore_state(&self, state: &VmState, split_irqchip: bool) -> Result<()> {
+        match (state, split_irqchip) {
+            (VmState::SplitIrqchip { clock }, true) => {
+                self.fd.set_clock(clock).map_err(Error::VmSetClock)?;
+            }
+            (
+                VmState::InKernelIrqchip {
+                    pitstate,
+                    clock,
+                    pic_master,
+                    pic_slave,
+                    ioapic,
+                },
+                false,
+            ) => {
+                self.fd.set_pit2(pitstate).map_err(Error::VmSetPit2)?;
+                self.fd.set_clock(clock).map_err(Error::VmSetClock)?;
+                self.fd
+                    .set_irqchip(pic_master)
+                    .map_err(Error::VmSetIrqChip)?;
+                self.fd
+                    .set_irqchip(pic_slave)
+                    .map_err(Error::VmSetIrqChip)?;
+                self.fd.set_irqchip(ioapic).map_err(Error::VmSetIrqChip)?;
+            }
+            _ => {
+                return Err(Error::StateCodec(
+                    "VM state targets a different interrupt-controller model".to_string(),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Captures VM-global KVM state in the backend ABI payload.
+    #[cfg(target_arch = "x86_64")]
+    pub fn capture_execution_state(&self, split_irqchip: bool) -> Result<Vec<u8>> {
+        let state = self.save_state(split_irqchip)?;
+        bincode::serde::encode_to_vec(&state, bincode::config::standard())
+            .map_err(|error| Error::StateCodec(error.to_string()))
+    }
+
+    /// Restores VM-global KVM state from the backend ABI payload.
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_execution_state(&self, bytes: &[u8], split_irqchip: bool) -> Result<()> {
+        let (state, consumed): (VmState, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+        if consumed != bytes.len() {
+            return Err(Error::StateCodec("trailing VM state bytes".to_string()));
+        }
+        self.restore_state(&state, split_irqchip)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        let state = self
+            .paused_arm_state
+            .as_ref()
+            .ok_or_else(|| Error::StateCodec("ARM64 clock is not paused".into()))?;
+        arm64_state::encode(&state.clock)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_execution_state(&mut self, bytes: &[u8]) -> Result<()> {
+        self.paused_arm_state = Some(arm64_state::PausedState {
+            clock: arm64_state::decode(bytes)?,
+            timers: Vec::new(),
+        });
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn pause_execution_time(&mut self, handles: &[VcpuHandle]) -> Result<()> {
+        self.paused_arm_state = Some(arm64_state::PausedState::capture(handles)?);
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn resume_execution_time(&mut self, handles: &[VcpuHandle]) -> Result<()> {
+        if let Some(state) = &self.paused_arm_state {
+            state.resume(handles)?;
+            self.paused_arm_state = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        Err(Error::StateCodec(
+            "execution-state capture is not qualified for this KVM architecture".to_string(),
+        ))
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    pub fn restore_execution_state(&self, _bytes: &[u8]) -> Result<()> {
+        Err(Error::StateCodec(
+            "execution-state restore is not qualified for this KVM architecture".to_string(),
+        ))
+    }
+
+    /// Completes a vCPU artifact on the VMM controller thread.
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn complete_vcpu_execution_capture(&self, _id: u32, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(bytes)
+    }
+
+    /// Prepares a vCPU artifact for restoration on its owning thread.
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn prepare_vcpu_execution_restore(&self, _id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+        Ok(bytes.to_vec())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn complete_vcpu_execution_capture(&self, id: u32, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        arm64_state::complete_capture(
+            &bytes,
+            self.paused_arm_state
+                .as_ref()
+                .ok_or_else(|| Error::StateCodec("ARM64 clock is not paused".into()))?,
+            id as usize,
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn prepare_vcpu_execution_restore(&mut self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+        let timer = arm64_state::stage_timer(bytes)?;
+        let paused = self
+            .paused_arm_state
+            .as_mut()
+            .ok_or_else(|| Error::StateCodec("ARM64 VM state was not restored".into()))?;
+        if id as usize != paused.timers.len() {
+            return Err(Error::StateCodec("ARM64 timer topology mismatch".into()));
+        }
+        paused.timers.push(timer);
+        Ok(bytes.to_vec())
     }
 }
 
 #[allow(unused)]
+// Keep the kernel ABI structs inline: this state is captured only at checkpoint boundaries, and
+// matching KVM's representation is clearer than adding heap indirection to shrink a rare value.
+#[allow(clippy::large_enum_variant)]
 #[cfg(target_arch = "x86_64")]
+#[derive(Serialize, Deserialize)]
 /// Structure holding VM kvm state.
-pub struct VmState {
-    pitstate: kvm_pit_state2,
-    clock: kvm_clock_data,
-    pic_master: kvm_irqchip,
-    pic_slave: kvm_irqchip,
-    ioapic: kvm_irqchip,
+pub enum VmState {
+    InKernelIrqchip {
+        pitstate: kvm_pit_state2,
+        clock: kvm_clock_data,
+        pic_master: kvm_irqchip,
+        pic_slave: kvm_irqchip,
+        ioapic: kvm_irqchip,
+    },
+    SplitIrqchip {
+        clock: kvm_clock_data,
+    },
+}
+
+fn host_page_size() -> Result<u64> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        Err(Error::DirtyPageSize(io::Error::last_os_error()))
+    } else {
+        Ok(page_size as u64)
+    }
+}
+
+fn bitmap_to_ranges(
+    guest_addr: u64,
+    region_size: u64,
+    page_size: u64,
+    bitmap: &[u64],
+    ranges: &mut Vec<GuestMemoryRange>,
+) {
+    let page_count = region_size.div_ceil(page_size);
+    let mut run_start = None;
+
+    for page in 0..=page_count {
+        let dirty = page < page_count
+            && bitmap
+                .get((page / 64) as usize)
+                .is_some_and(|word| word & (1_u64 << (page % 64)) != 0);
+        match (run_start, dirty) {
+            (None, true) => run_start = Some(page),
+            (Some(start), false) => {
+                let start_offset = start * page_size;
+                let end_offset = (page * page_size).min(region_size);
+                ranges.push(
+                    GuestMemoryRange::new(guest_addr + start_offset, end_offset - start_offset)
+                        .expect("KVM dirty bitmap describes a registered memory region"),
+                );
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
@@ -1077,8 +1399,8 @@ impl Vcpu {
         #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
     ) -> Result<Self> {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
-        let (event_sender, event_receiver) = unbounded();
-        let (response_sender, response_receiver) = unbounded();
+        let (event_sender, event_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
+        let (response_sender, response_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
 
         let kernel_enomem_workaround = if env::var_os("KRUN_ENOMEM_WORKAROUND").is_some() {
             debug!("Enabling ENOMEM workaround");
@@ -1127,8 +1449,8 @@ impl Vcpu {
         metrics: MetricsWriter,
     ) -> Result<Self> {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
-        let (event_sender, event_receiver) = unbounded();
-        let (response_sender, response_receiver) = unbounded();
+        let (event_sender, event_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
+        let (response_sender, response_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
 
         Ok(Vcpu {
             fd: kvm_vcpu,
@@ -1164,8 +1486,8 @@ impl Vcpu {
         metrics: MetricsWriter,
     ) -> Result<Self> {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
-        let (event_sender, event_receiver) = unbounded();
-        let (response_sender, response_receiver) = unbounded();
+        let (event_sender, event_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
+        let (response_sender, response_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
 
         Ok(Vcpu {
             fd: kvm_vcpu,
@@ -1329,6 +1651,8 @@ impl Vcpu {
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
     pub fn start_threaded(mut self) -> Result<(VcpuHandle, VcpuPlacementResult)> {
+        #[cfg(target_arch = "aarch64")]
+        let control = arm64_state::VcpuControl::duplicate(&self.fd)?;
         let event_sender = self.event_sender.take().unwrap();
         let response_receiver = self.response_receiver.take().unwrap();
         let (init_tls_sender, init_tls_receiver) = unbounded();
@@ -1354,10 +1678,14 @@ impl Vcpu {
             .recv()
             .expect("Error waiting for vcpu initialization.")?;
 
-        Ok((
-            VcpuHandle::new(event_sender, response_receiver, vcpu_thread),
-            placement,
-        ))
+        let handle = VcpuHandle::new(event_sender, response_receiver, vcpu_thread);
+        #[cfg(target_arch = "aarch64")]
+        let handle = {
+            let mut handle = handle;
+            handle.arm_control = Some(control);
+            handle
+        };
+        Ok((handle, placement))
     }
 
     /// Applies the resolved affinity from within the vCPU thread itself.
@@ -1415,9 +1743,21 @@ impl Vcpu {
             .fd
             .get_vcpu_events()
             .map_err(Error::VcpuGetVcpuEvents)?;
+        let tsc_khz = self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?;
         Ok(VcpuState {
-            cpuid: self.cpuid.clone(),
-            msrs,
+            cpuid: self
+                .cpuid
+                .as_slice()
+                .iter()
+                .copied()
+                .map(KvmCpuidEntryState::from)
+                .collect(),
+            msrs: msrs
+                .as_slice()
+                .iter()
+                .copied()
+                .map(KvmMsrEntryState::from)
+                .collect(),
             debug_regs,
             lapic,
             mp_state,
@@ -1426,7 +1766,52 @@ impl Vcpu {
             vcpu_events,
             xcrs,
             xsave,
+            tsc_khz,
         })
+    }
+
+    /// Captures a bounded backend payload while running on the owning vCPU thread.
+    #[cfg(target_arch = "x86_64")]
+    fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        let state = self.save_state()?;
+        bincode::serde::encode_to_vec(&state, bincode::config::standard())
+            .map_err(|error| Error::StateCodec(error.to_string()))
+    }
+
+    /// Restores a backend payload while running on the owning vCPU thread.
+    #[cfg(target_arch = "x86_64")]
+    fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
+        let (state, consumed): (VcpuState, usize) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+        if consumed != bytes.len() {
+            return Err(Error::StateCodec("trailing vCPU state bytes".to_string()));
+        }
+        self.restore_state(state)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        arm64_state::capture_cpu(&self.fd)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
+        arm64_state::restore_cpu(&self.fd, bytes)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        Err(Error::StateCodec(
+            "execution-state capture is not qualified for this KVM architecture".to_string(),
+        ))
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn restore_execution_state(&self, _bytes: &[u8]) -> Result<()> {
+        Err(Error::StateCodec(
+            "execution-state restore is not qualified for this KVM architecture".to_string(),
+        ))
     }
 
     #[allow(unused)]
@@ -1454,9 +1839,28 @@ impl Vcpu {
          * SET_LAPIC must come before SET_MSRS, because the TSC deadline MSR
          * only restores successfully, when the LAPIC is correctly configured.
          */
+        if state.cpuid.len() > KVM_MAX_CPUID_ENTRIES || state.msrs.len() > KVM_MAX_MSR_ENTRIES {
+            return Err(Error::StateCodec(
+                "KVM execution state exceeds the supported register inventory".to_string(),
+            ));
+        }
+        let mut cpuid =
+            CpuId::new(state.cpuid.len()).map_err(|error| Error::StateCodec(error.to_string()))?;
+        for (target, source) in cpuid.as_mut_slice().iter_mut().zip(&state.cpuid) {
+            *target = (*source).into();
+        }
+        let destination_supports_xss = self.msr_list.as_slice().contains(&MSR_IA32_XSS);
+        let (xss, generic_msr_states) = split_restored_msrs(&state.msrs, destination_supports_xss)?;
+        let mut msrs = Msrs::new(generic_msr_states.len())
+            .map_err(|error| Error::StateCodec(error.to_string()))?;
+        for (target, source) in msrs.as_mut_slice().iter_mut().zip(&generic_msr_states) {
+            *target = (*source).into();
+        }
+
+        self.fd.set_cpuid2(&cpuid).map_err(Error::VcpuSetCpuid)?;
         self.fd
-            .set_cpuid2(&state.cpuid)
-            .map_err(Error::VcpuSetCpuid)?;
+            .set_tsc_khz(state.tsc_khz)
+            .map_err(Error::VcpuSetTscKhz)?;
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;
@@ -1464,6 +1868,16 @@ impl Vcpu {
         self.fd
             .set_sregs(&state.sregs)
             .map_err(Error::VcpuSetSregs)?;
+        if let Some(xss) = xss {
+            let xss = Msrs::from_entries(&[xss.into()])
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+            let restored_xss = self.fd.set_msrs(&xss).map_err(Error::VcpuSetMsrs)?;
+            if restored_xss != 1 {
+                return Err(Error::StateCodec(
+                    "KVM did not restore the required IA32_XSS state".to_string(),
+                ));
+            }
+        }
         unsafe {
             self.fd
                 .set_xsave(&state.xsave)
@@ -1476,7 +1890,13 @@ impl Vcpu {
         self.fd
             .set_lapic(&state.lapic)
             .map_err(Error::VcpuSetLapic)?;
-        self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
+        let restored_msrs = self.fd.set_msrs(&msrs).map_err(Error::VcpuSetMsrs)?;
+        if restored_msrs != msrs.as_slice().len() {
+            return Err(Error::StateCodec(format!(
+                "KVM restored {restored_msrs} of {} MSRs",
+                msrs.as_slice().len()
+            )));
+        }
         self.fd
             .set_vcpu_events(&state.vcpu_events)
             .map_err(Error::VcpuSetVcpuEvents)?;
@@ -1712,11 +2132,12 @@ impl Vcpu {
 
         // Break this emulation loop on any transition request/external event.
         match self.event_receiver.try_recv() {
+            Ok(VcpuEvent::Terminate) => return StateMachine::finish(),
             // Running ---- Pause ----> Paused
-            Ok(VcpuEvent::Pause) => {
+            Ok(VcpuEvent::Pause { request_id }) => {
                 // Nothing special to do.
                 self.response_sender
-                    .send(VcpuResponse::Paused)
+                    .send(VcpuResponse::Paused { request_id })
                     .expect("failed to send pause status");
 
                 // TODO: we should call `KVM_KVMCLOCK_CTRL` here to make sure
@@ -1725,10 +2146,26 @@ impl Vcpu {
                 // Move to 'paused' state.
                 state = StateMachine::next(Self::paused);
             }
-            Ok(VcpuEvent::Resume) => {
+            Ok(VcpuEvent::Resume { request_id }) => {
                 self.response_sender
-                    .send(VcpuResponse::Resumed)
+                    .send(VcpuResponse::Resumed { request_id })
                     .expect("failed to send resume status");
+            }
+            Ok(VcpuEvent::CaptureState { request_id }) => {
+                let result = self
+                    .capture_execution_state()
+                    .map_err(|error| error.to_string());
+                self.response_sender
+                    .send(VcpuResponse::StateCaptured { request_id, result })
+                    .expect("failed to send captured vCPU state");
+            }
+            Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
+                let result = self
+                    .restore_execution_state(&bytes)
+                    .map_err(|error| error.to_string());
+                self.response_sender
+                    .send(VcpuResponse::StateRestored { request_id, result })
+                    .expect("failed to send restored vCPU state");
             }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
@@ -1745,17 +2182,41 @@ impl Vcpu {
     // This is the main loop of the `Paused` state.
     fn paused(&mut self) -> StateMachine<Self> {
         match self.event_receiver.recv() {
+            Ok(VcpuEvent::Terminate) => StateMachine::finish(),
             // Paused ---- Resume ----> Running
-            Ok(VcpuEvent::Resume) => {
+            Ok(VcpuEvent::Resume { request_id }) => {
                 // Nothing special to do.
                 self.response_sender
-                    .send(VcpuResponse::Resumed)
+                    .send(VcpuResponse::Resumed { request_id })
                     .expect("failed to send resume status");
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
             }
-            // All other events have no effect on current 'paused' state.
-            Ok(_) => StateMachine::next(Self::paused),
+            // Repeated pauses are idempotent and still acknowledge their own request id.
+            Ok(VcpuEvent::Pause { request_id }) => {
+                self.response_sender
+                    .send(VcpuResponse::Paused { request_id })
+                    .expect("failed to send pause status");
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::CaptureState { request_id }) => {
+                let result = self
+                    .capture_execution_state()
+                    .map_err(|error| error.to_string());
+                self.response_sender
+                    .send(VcpuResponse::StateCaptured { request_id, result })
+                    .expect("failed to send captured vCPU state");
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
+                let result = self
+                    .restore_execution_state(&bytes)
+                    .map_err(|error| error.to_string());
+                self.response_sender
+                    .send(VcpuResponse::StateRestored { request_id, result })
+                    .expect("failed to send restored vCPU state");
+                StateMachine::next(Self::paused)
+            }
             // Unhandled exit of the other end.
             Err(_) => {
                 // Move to 'exited' state.
@@ -1782,12 +2243,12 @@ impl Vcpu {
     #[cfg(not(test))]
     // This is the main loop of the `Exited` state.
     fn exited(&mut self) -> StateMachine<Self> {
-        // Wait indefinitely.
-        // The VMM thread will kill the entire process.
-        let barrier = Barrier::new(2);
-        barrier.wait();
-
-        StateMachine::finish()
+        // Guest shutdown still reports through the exit event, but an embedding runtime may keep
+        // the process alive while it drops this VM. Keep the vCPU joinable in that case.
+        match self.event_receiver.recv() {
+            Ok(VcpuEvent::Terminate) | Err(_) => StateMachine::finish(),
+            Ok(_) => StateMachine::next(Self::exited),
+        }
     }
 
     #[cfg(feature = "tdx")]
@@ -1803,6 +2264,36 @@ impl Vcpu {
     fn exit(&mut self, _: u8) -> StateMachine<Self> {
         // State machine reached its end.
         StateMachine::finish()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn split_restored_msrs(
+    saved: &[KvmMsrEntryState],
+    destination_supports_xss: bool,
+) -> Result<(Option<KvmMsrEntryState>, Vec<KvmMsrEntryState>)> {
+    let mut xss = None;
+    let mut generic = Vec::with_capacity(saved.len());
+    for entry in saved {
+        if entry.index == MSR_IA32_XSS {
+            if xss.replace(*entry).is_some() {
+                return Err(Error::StateCodec(
+                    "KVM execution state contains duplicate IA32_XSS entries".to_string(),
+                ));
+            }
+        } else {
+            generic.push(*entry);
+        }
+    }
+
+    match (destination_supports_xss, xss) {
+        (true, None) => Err(Error::StateCodec(
+            "KVM execution state is missing required IA32_XSS state".to_string(),
+        )),
+        (false, Some(_)) => Err(Error::StateCodec(
+            "destination KVM does not support saved IA32_XSS state".to_string(),
+        )),
+        (_, xss) => Ok((xss, generic)),
     }
 }
 
@@ -1870,10 +2361,11 @@ impl Drop for Vcpu {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[derive(Serialize, Deserialize)]
 /// Structure holding VCPU kvm state.
 pub struct VcpuState {
-    cpuid: CpuId,
-    msrs: Msrs,
+    cpuid: Vec<KvmCpuidEntryState>,
+    msrs: Vec<KvmMsrEntryState>,
     debug_regs: kvm_debugregs,
     lapic: kvm_lapic_state,
     mp_state: kvm_mp_state,
@@ -1882,6 +2374,82 @@ pub struct VcpuState {
     vcpu_events: kvm_vcpu_events,
     xcrs: kvm_xcrs,
     xsave: kvm_xsave,
+    tsc_khz: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct KvmCpuidEntryState {
+    function: u32,
+    index: u32,
+    flags: u32,
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+    padding: [u32; 3],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl From<kvm_cpuid_entry2> for KvmCpuidEntryState {
+    fn from(entry: kvm_cpuid_entry2) -> Self {
+        Self {
+            function: entry.function,
+            index: entry.index,
+            flags: entry.flags,
+            eax: entry.eax,
+            ebx: entry.ebx,
+            ecx: entry.ecx,
+            edx: entry.edx,
+            padding: entry.padding,
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl From<KvmCpuidEntryState> for kvm_cpuid_entry2 {
+    fn from(entry: KvmCpuidEntryState) -> Self {
+        Self {
+            function: entry.function,
+            index: entry.index,
+            flags: entry.flags,
+            eax: entry.eax,
+            ebx: entry.ebx,
+            ecx: entry.ecx,
+            edx: entry.edx,
+            padding: entry.padding,
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct KvmMsrEntryState {
+    index: u32,
+    reserved: u32,
+    data: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl From<kvm_msr_entry> for KvmMsrEntryState {
+    fn from(entry: kvm_msr_entry) -> Self {
+        Self {
+            index: entry.index,
+            reserved: entry.reserved,
+            data: entry.data,
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl From<KvmMsrEntryState> for kvm_msr_entry {
+    fn from(entry: KvmMsrEntryState) -> Self {
+        Self {
+            index: entry.index,
+            reserved: entry.reserved,
+            data: entry.data,
+        }
+    }
 }
 
 // Allow currently unused Pause and Exit events. These will be used by the vmm later on.
@@ -1889,26 +2457,67 @@ pub struct VcpuState {
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
+    /// Stop the vCPU thread without reporting a guest exit.
+    Terminate,
     /// Pause the Vcpu.
-    Pause,
+    Pause {
+        /// Correlates this command with its acknowledgement.
+        request_id: VcpuControlRequestId,
+    },
     /// Event that should resume the Vcpu.
-    Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    Resume {
+        /// Correlates this command with its acknowledgement.
+        request_id: VcpuControlRequestId,
+    },
+    /// Capture backend state on the owning paused vCPU thread.
+    CaptureState {
+        /// Correlates this command with its response.
+        request_id: VcpuControlRequestId,
+    },
+    /// Restore backend state on the owning paused vCPU thread.
+    RestoreState {
+        /// Correlates this command with its response.
+        request_id: VcpuControlRequestId,
+        /// Opaque bytes produced by this backend codec.
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Vcpu is paused.
-    Paused,
+    Paused {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+    },
     /// Vcpu is resumed.
-    Resumed,
+    Resumed {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+    },
+    /// Backend state captured on the vCPU thread.
+    StateCaptured {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+        /// Encoded state or the backend failure.
+        result: std::result::Result<Vec<u8>, String>,
+    },
+    /// Backend state restored on the vCPU thread.
+    StateRestored {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+        /// Restore result from the backend codec.
+        result: std::result::Result<(), String>,
+    },
     /// Vcpu is stopped.
     Exited(u8),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {
+    #[cfg(target_arch = "aarch64")]
+    arm_control: Option<arm64_state::VcpuControl>,
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
     // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
@@ -1917,6 +2526,18 @@ pub struct VcpuHandle {
 }
 
 impl VcpuHandle {
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn arm_control(&self) -> Result<&arm64_state::VcpuControl> {
+        self.arm_control
+            .as_ref()
+            .ok_or_else(|| Error::StateCodec("missing ARM64 controller descriptor".into()))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn mpidr(&self) -> Result<u64> {
+        self.arm_control()?.read(arm64_state::MPIDR)
+    }
+
     pub fn new(
         event_sender: Sender<VcpuEvent>,
         response_receiver: Receiver<VcpuResponse>,
@@ -1926,6 +2547,8 @@ impl VcpuHandle {
             event_sender,
             response_receiver,
             vcpu_thread: Some(vcpu_thread),
+            #[cfg(target_arch = "aarch64")]
+            arm_control: None,
         }
     }
 
@@ -1935,13 +2558,16 @@ impl VcpuHandle {
             .send(event)
             .expect("event sender channel closed on vcpu end.");
         // Kick the vcpu so it picks up the message.
+        self.kick()
+    }
+
+    pub fn kick(&self) -> Result<()> {
         self.vcpu_thread
             .as_ref()
             // Safe to unwrap since constructor make this 'Some'.
             .unwrap()
             .kill(sigrtmin() + VCPU_RTSIG_OFFSET)
-            .map_err(Error::SignalVcpu)?;
-        Ok(())
+            .map_err(Error::SignalVcpu)
     }
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
@@ -1951,11 +2577,11 @@ impl VcpuHandle {
 
 impl Drop for VcpuHandle {
     fn drop(&mut self) {
-        // A startup barrier may abort after earlier vCPU threads reached Paused. Close their
-        // control channels and join them before the owning VM is destroyed.
-        let _ = self.send_event(VcpuEvent::Pause);
-        let (event_sender, _event_receiver) = unbounded();
-        self.event_sender = event_sender;
+        // Construction and restore can fail while this thread is either blocked in Paused or
+        // executing KVM_RUN. Termination is distinct from a guest pause/exit, and the kick makes
+        // the running case observe it before the owning VM disappears.
+        let _ = self.event_sender.send(VcpuEvent::Terminate);
+        let _ = self.kick();
         if let Some(thread) = self.vcpu_thread.take() {
             let _ = thread.join();
         }
@@ -1984,6 +2610,66 @@ mod tests {
     use devices::legacy::KvmIoapic;
 
     use utils::signal::validate_signal_num;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restored_msrs_require_and_separate_xss_when_supported() {
+        let generic = KvmMsrEntryState {
+            index: 0x10,
+            reserved: 0,
+            data: 7,
+        };
+        let xss = KvmMsrEntryState {
+            index: MSR_IA32_XSS,
+            reserved: 0,
+            data: 0x800,
+        };
+
+        let (resolved_xss, resolved_generic) = split_restored_msrs(&[generic, xss], true).unwrap();
+        assert_eq!(resolved_xss.unwrap().data, 0x800);
+        assert_eq!(resolved_generic.len(), 1);
+        assert_eq!(resolved_generic[0].index, generic.index);
+
+        let error = match split_restored_msrs(&[generic], true) {
+            Err(error) => error,
+            Ok(_) => panic!("missing IA32_XSS state was accepted"),
+        };
+        assert!(error.to_string().contains("missing required IA32_XSS"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restored_msrs_reject_xss_when_destination_lacks_it() {
+        let xss = KvmMsrEntryState {
+            index: MSR_IA32_XSS,
+            reserved: 0,
+            data: 0x800,
+        };
+
+        let error = match split_restored_msrs(&[xss], false) {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported IA32_XSS state was accepted"),
+        };
+        assert!(error
+            .to_string()
+            .contains("destination KVM does not support saved IA32_XSS"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restored_msrs_reject_duplicate_xss_entries() {
+        let xss = KvmMsrEntryState {
+            index: MSR_IA32_XSS,
+            reserved: 0,
+            data: 0x800,
+        };
+
+        let error = match split_restored_msrs(&[xss, xss], true) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate IA32_XSS state was accepted"),
+        };
+        assert!(error.to_string().contains("duplicate IA32_XSS"));
+    }
 
     #[test]
     fn best_effort_host_affinity_reports_os_rejection_as_inherited() {

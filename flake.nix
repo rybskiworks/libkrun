@@ -49,7 +49,11 @@
           rustPlatform = pkgs.makeRustPlatform {
             inherit (pkgs.fenix.stable) cargo rustc;
           };
-          cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+          cargoDeps = rustPlatform.importCargoLock {
+            lockFile = ./Cargo.lock;
+            outputHashes."msb-vm-memory-0.18.0-msb.1" =
+              "sha256-aZc0jr3XqrZHyLnQz/NwjUCfsxy7YNAsqjVWrqHYH30=";
+          };
           initLdflags = "-L${pkgs.glibc.static}/lib";
           # Bindgen loads the pinned libclang from LIBCLANG_PATH at build time.
           cargoFlags = "--locked --offline --features msb_krun_input/bindgen_clang_runtime";

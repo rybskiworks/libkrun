@@ -39,8 +39,10 @@ pub mod linux_errno;
 // instantiate the device (extra capacity is rejected at config time), but the
 // vCPU run loops still reference its enforcement types unconditionally.
 pub mod cpu;
+mod dirty_bitmap;
 #[cfg(not(feature = "tee"))]
 pub mod mem;
+pub mod memory_access;
 mod mmio;
 pub mod msb_metrics;
 #[cfg(feature = "net")]
@@ -52,13 +54,18 @@ pub mod rng;
 pub mod snd;
 // Preserve vsock for existing Unix TEE builds while enabling it for ordinary
 // Windows guests. Windows TEE combinations continue to omit the device.
+#[cfg(not(feature = "tee"))]
+pub mod vmgenid;
 #[cfg(any(not(target_os = "windows"), not(feature = "tee")))]
 pub mod vsock;
 
 #[cfg(not(feature = "tee"))]
 pub use self::balloon::*;
 #[cfg(feature = "blk")]
-pub use self::block::{Block, CacheType};
+pub use self::block::{
+    Block, BlockBackendSpec, BlockLayerSpec, BlockState, CacheType, PreparedBlockBackend,
+    BLOCK_STATE_VERSION,
+};
 pub use self::console::*;
 pub use self::cpu::*;
 pub use self::device::*;
@@ -68,15 +75,18 @@ pub use self::fs::*;
 pub use self::gpu::*;
 #[cfg(not(feature = "tee"))]
 pub use self::mem::*;
+pub use self::memory_access::*;
 pub use self::mmio::*;
 pub use self::msb_metrics::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
-pub use self::queue::{Descriptor, DescriptorChain, Queue};
+pub use self::queue::{Descriptor, DescriptorChain, Queue, QueueState, QUEUE_STATE_VERSION};
 #[cfg(all(not(target_os = "windows"), not(feature = "tee")))]
 pub use self::rng::*;
 #[cfg(feature = "snd")]
 pub use self::snd::Snd;
+#[cfg(not(feature = "tee"))]
+pub use self::vmgenid::*;
 #[cfg(any(not(target_os = "windows"), not(feature = "tee")))]
 pub use self::vsock::*;
 

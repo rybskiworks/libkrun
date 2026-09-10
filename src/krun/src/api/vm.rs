@@ -2,9 +2,13 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+#[cfg(any(not(feature = "tee"), test))]
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
+#[cfg(not(feature = "tee"))]
+use std::time::Duration;
 use std::time::{Instant, SystemTime};
 
 #[cfg(target_os = "linux")]
@@ -19,6 +23,8 @@ use devices::virtio::vsock::VsockPortBackend;
 use log::error;
 use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
+#[cfg(not(feature = "tee"))]
+use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
 #[cfg(not(target_os = "windows"))]
 use vmm::resources::TsiFlags;
 use vmm::resources::VmResources;
@@ -83,20 +89,171 @@ pub struct Vm {
     _krunfw_library: Option<libloading::Library>,
     /// Keeps an explicit initramfs allocation alive until it is copied to guest memory.
     _initramfs_data: Option<Vec<u8>>,
+    /// Receives the VMM reference and execution-state notifications after startup begins.
+    #[cfg(not(feature = "tee"))]
+    vmm_control: Arc<VmControlRegistry>,
+    #[cfg(not(feature = "tee"))]
+    execution_restore: Option<vmm::execution_state::ExecutionState>,
+    #[cfg(not(feature = "tee"))]
+    memory_restore: Option<Box<dyn VmMemoryRestoreSource>>,
+    /// Device state installed after memory/execution reconstruction and before first activation.
+    #[cfg(all(not(feature = "tee"), feature = "blk"))]
+    device_restores: Vec<VmDeviceRestore>,
+    /// Leave the constructed VMM at its initial paused boundary for an external activation gate.
+    #[cfg(not(feature = "tee"))]
+    start_paused: bool,
+}
+
+/// One construction-only device restore requested before [`Vm::enter`].
+#[cfg(all(not(feature = "tee"), feature = "blk"))]
+enum VmDeviceRestore {
+    Virtio(vmm::device_state::VirtioDeviceState),
+    Block {
+        device_id: String,
+        state: vmm::device_state::BlockDeviceState,
+    },
+}
+
+/// Streams a complete memory image into a newly constructed, never-activated VM.
+///
+/// Implementations may read directly from an archive or object store. They do not need to stage a
+/// second complete copy of guest memory before calling [`Vm::enter`].
+#[cfg(not(feature = "tee"))]
+pub trait VmMemoryRestoreSource: Send {
+    /// Materializes every range required by the complete memory generation.
+    fn restore(&mut self, target: &mut dyn VmMemoryRestoreTarget) -> io::Result<()>;
+}
+
+/// Construction-only target used by [`VmMemoryRestoreSource`].
+#[cfg(not(feature = "tee"))]
+pub trait VmMemoryRestoreTarget {
+    /// Writes exact bytes to one guest-physical range.
+    fn write_bytes(
+        &mut self,
+        range: vmm::memory_state::GuestMemoryRange,
+        bytes: &[u8],
+    ) -> io::Result<()>;
+
+    /// Writes zeros to one guest-physical range without requiring a source buffer.
+    fn write_zero(&mut self, range: vmm::memory_state::GuestMemoryRange) -> io::Result<()>;
+}
+
+#[cfg(not(feature = "tee"))]
+struct VmmMemoryRestoreTarget<'a> {
+    vmm: &'a mut vmm::Vmm,
+    expected: Vec<vmm::memory_state::GuestMemoryRange>,
+    restored: Vec<vmm::memory_state::GuestMemoryRange>,
+}
+
+/// Shared VMM registry and notification point for execution-state observers.
+#[cfg(not(feature = "tee"))]
+struct VmControlRegistry {
+    state: std::sync::Mutex<VmControlRegistryState>,
+    state_changed: std::sync::Condvar,
+}
+
+/// State protected by [`VmControlRegistry::state`].
+#[cfg(not(feature = "tee"))]
+struct VmControlRegistryState {
+    vmm: Option<std::sync::Weak<std::sync::Mutex<vmm::Vmm>>>,
+    execution: Option<VmExecutionState>,
+    transitioning: bool,
 }
 
 /// Cloneable handle for live VM resource control.
 ///
 /// Obtained through [`Vm::control_handle`] before `enter()`; background
-/// threads use it to drive live resizes while the VM runs. Memory resize is
-/// backed by virtio-mem and only available when the machine reserved capacity
-/// with [`max_memory_mib`](super::builders::MachineBuilder::max_memory_mib).
+/// threads use it to establish generation-scoped pause barriers and drive live resizes while the
+/// VM runs. Memory resize is backed by virtio-mem and only available when the machine reserved
+/// capacity with [`max_memory_mib`](super::builders::MachineBuilder::max_memory_mib).
 #[cfg(not(feature = "tee"))]
 #[derive(Clone)]
 pub struct VmControl {
     boot_mib: u64,
     mem: Option<Arc<std::sync::Mutex<devices::virtio::Mem>>>,
     cpu: Option<Arc<std::sync::Mutex<devices::virtio::Cpu>>>,
+    vmm: Arc<VmControlRegistry>,
+    generation: Option<Arc<std::sync::Mutex<devices::virtio::Generation>>>,
+}
+
+/// Runtime-local generation of one completed VM-wide pause barrier.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmPauseGeneration(vmm::PauseGeneration);
+
+#[cfg(not(feature = "tee"))]
+impl VmPauseGeneration {
+    /// Returns the request id that established this pause boundary.
+    pub fn get(self) -> u64 {
+        self.0.request_id().get()
+    }
+}
+
+/// Point-in-time execution state observed through [`VmControl`].
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmExecutionState {
+    /// Every vCPU has acknowledged this pause generation.
+    Paused(VmPauseGeneration),
+    /// Every vCPU resumed from this pause generation.
+    Running {
+        /// Pause generation from which execution most recently resumed.
+        resumed_from: VmPauseGeneration,
+    },
+    /// A partial or timed-out control barrier makes the execution boundary uncertain.
+    Indeterminate,
+}
+
+/// Opaque 16-byte value mixed into the guest kernel CRNG after clone or rollback.
+#[cfg(not(feature = "tee"))]
+pub type VmGenerationId = devices::virtio::GenerationId;
+
+/// One exact VM-generation request installed by the host.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGenerationRequest {
+    /// Device-local sequence used to reject delayed acknowledgements.
+    pub sequence: u64,
+
+    /// Identifier the guest kernel must process for this request.
+    pub id: VmGenerationId,
+}
+
+/// Point-in-time state of the VM-generation device.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmGenerationState {
+    /// Whether the guest driver completed probing.
+    pub driver_ready: bool,
+
+    /// Whether the guest driver rejected the device protocol.
+    pub driver_error: bool,
+
+    /// Whether the bound guest kernel can correct wall time before activation acknowledgement.
+    pub clock_sync_supported: bool,
+
+    /// Request currently published by the host, if one has been installed.
+    pub requested: Option<VmGenerationRequest>,
+
+    /// Request last reported as processed by the guest kernel, if any.
+    pub processed: Option<VmGenerationRequest>,
+}
+
+/// Result of waiting for one exact VM-generation request.
+#[cfg(not(feature = "tee"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VmGenerationWaitOutcome {
+    /// The guest kernel processed the exact sequence and identifier.
+    Processed,
+
+    /// A newer request replaced this request before it was acknowledged.
+    Superseded,
+
+    /// The deadline elapsed without an exact acknowledgement.
+    TimedOut,
+
+    /// The guest kernel rejected activation without acknowledging it.
+    Failed,
 }
 
 /// Point-in-time CPU sizing of a running VM as seen through [`VmControl`].
@@ -196,7 +353,85 @@ impl Vm {
             vsock_host_port_map,
             _krunfw_library: None,
             _initramfs_data: None,
+            #[cfg(not(feature = "tee"))]
+            vmm_control: Arc::new(VmControlRegistry::new()),
+            #[cfg(not(feature = "tee"))]
+            execution_restore: None,
+            #[cfg(not(feature = "tee"))]
+            memory_restore: None,
+            #[cfg(all(not(feature = "tee"), feature = "blk"))]
+            device_restores: Vec::new(),
+            #[cfg(not(feature = "tee"))]
+            start_paused: false,
         }
+    }
+
+    /// Supplies backend-qualified execution state to restore before the first guest instruction.
+    #[cfg(not(feature = "tee"))]
+    pub fn set_execution_restore(&mut self, state: vmm::execution_state::ExecutionState) {
+        self.execution_restore = Some(state);
+    }
+
+    /// Supplies a streaming complete-memory source to run before the first guest instruction.
+    #[cfg(not(feature = "tee"))]
+    pub fn set_memory_restore<S>(&mut self, source: S)
+    where
+        S: VmMemoryRestoreSource + 'static,
+    {
+        self.memory_restore = Some(Box::new(source));
+    }
+
+    /// Supply an immutable private file mapping instead of streaming memory into anonymous RAM.
+    /// Execution restore must also be supplied. The caller owns file immutability, and unsupported
+    /// placement/discard combinations fail before activation rather than selecting eager memory.
+    #[cfg(not(feature = "tee"))]
+    pub fn set_private_memory_backing(
+        &mut self,
+        backing: vmm::private_memory::PrivateMemoryBacking,
+    ) {
+        self.vmr.private_memory_backing = Some(backing);
+    }
+
+    /// Use private sparse zero backing for a fresh boot; this does not create a checkpoint.
+    #[cfg(not(feature = "tee"))]
+    pub fn set_private_memory_boot(&mut self, enabled: bool) {
+        self.vmr.private_memory_boot = enabled;
+    }
+
+    /// Supplies one destination-recreated virtio device state for construction-only restore.
+    ///
+    /// Device restores run after memory and execution reconstruction but before the first guest
+    /// instruction. The restored device remains quiesced until the VM is activated.
+    #[cfg(all(not(feature = "tee"), feature = "blk"))]
+    pub fn add_virtio_device_restore(&mut self, state: vmm::device_state::VirtioDeviceState) {
+        self.device_restores.push(VmDeviceRestore::Virtio(state));
+    }
+
+    /// Supplies one virtio-block state for construction-only restore.
+    ///
+    /// `device_id` names the already-configured destination block device. Its backend must be
+    /// resolved by the caller before [`enter()`](Self::enter); captured host handles are never
+    /// reopened from device-state bytes.
+    #[cfg(all(not(feature = "tee"), feature = "blk"))]
+    pub fn add_block_device_restore(
+        &mut self,
+        device_id: impl Into<String>,
+        state: vmm::device_state::BlockDeviceState,
+    ) {
+        self.device_restores.push(VmDeviceRestore::Block {
+            device_id: device_id.into(),
+            state,
+        });
+    }
+
+    /// Select whether initial activation remains paused after construction and restore.
+    ///
+    /// The default is `false`, preserving ordinary boot behavior. Restore coordinators set this
+    /// to `true`, wait for [`VmControl::wait_until_paused`], complete freshness/ownership gates,
+    /// and resume with the returned generation token.
+    #[cfg(not(feature = "tee"))]
+    pub fn set_start_paused(&mut self, start_paused: bool) {
+        self.start_paused = start_paused;
     }
 
     /// Get a cloneable handle that triggers VM exit from any thread.
@@ -238,7 +473,7 @@ impl Vm {
         self.vmr.metrics.handle()
     }
 
-    /// Get a cloneable handle for live VM resource control.
+    /// Get a cloneable handle for execution and resource control.
     ///
     /// Must be called **before** [`enter()`](Self::enter), because `enter()`
     /// never returns on a successful boot. Live memory resize is only
@@ -251,6 +486,8 @@ impl Vm {
             boot_mib: self.vmr.vm_config().mem_size_mib.unwrap_or(128) as u64,
             mem: self.vmr.mem_device.clone(),
             cpu: self.vmr.cpu_device.clone(),
+            vmm: Arc::clone(&self.vmm_control),
+            generation: self.vmr.generation_device.clone(),
         }
     }
 
@@ -259,6 +496,24 @@ impl Vm {
     ///
     /// Only returns `Err` if something fails before the VMM takes over.
     pub fn enter(mut self) -> Result<Infallible> {
+        #[cfg(not(feature = "tee"))]
+        if self.vmr.private_memory_boot
+            && (self.vmr.private_memory_backing.is_some()
+                || self.memory_restore.is_some()
+                || self.execution_restore.is_some())
+        {
+            return Err(Error::Build(BuildError::Start(
+                "private zero boot excludes restored memory and execution state".into(),
+            )));
+        }
+        #[cfg(not(feature = "tee"))]
+        if self.vmr.private_memory_backing.is_some()
+            && (self.memory_restore.is_some() || self.execution_restore.is_none())
+        {
+            return Err(Error::Build(BuildError::Start(
+                "private memory backing requires execution restore and excludes an eager memory source".into(),
+            )));
+        }
         let mut trace = BootTrace::new("api");
         trace.mark("enter.start");
 
@@ -329,16 +584,80 @@ impl Vm {
         .map_err(|e| Error::Build(BuildError::Start(format!("build_microvm: {e:?}"))))?;
         trace.mark("build_microvm.ready");
 
+        #[cfg(not(feature = "tee"))]
+        {
+            let mut vmm = _vmm.lock().expect("Poisoned VMM mutex");
+            if let Some(mut source) = self.memory_restore.take() {
+                let mut target = VmmMemoryRestoreTarget::new(&mut vmm);
+                source.restore(&mut target).map_err(|error| {
+                    Error::Build(BuildError::Start(format!("restore memory: {error}")))
+                })?;
+                target.finish().map_err(|error| {
+                    Error::Build(BuildError::Start(format!("restore memory: {error}")))
+                })?;
+            }
+            if let Some(state) = self.execution_restore.take() {
+                vmm.restore_execution_state(&state).map_err(|error| {
+                    Error::Build(BuildError::Start(format!(
+                        "restore execution state: {error}"
+                    )))
+                })?;
+            }
+            #[cfg(feature = "blk")]
+            for restore in self.device_restores.drain(..) {
+                match restore {
+                    VmDeviceRestore::Virtio(state) => {
+                        vmm.restore_virtio_device_state(&state).map_err(|error| {
+                            Error::Build(BuildError::Start(format!(
+                                "restore virtio device {}: {error}",
+                                state.device_id
+                            )))
+                        })?
+                    }
+                    VmDeviceRestore::Block { device_id, state } => vmm
+                        .restore_block_device_state(&device_id, &state)
+                        .map_err(|error| {
+                            Error::Build(BuildError::Start(format!(
+                                "restore block device {device_id}: {error}"
+                            )))
+                        })?,
+                }
+            }
+        }
+        trace.mark("restore.ready");
+
         if let Some(observer) = self.placement_observer.take() {
             observer(&placement_report);
         }
         trace.mark("placement.reconciled");
 
+        #[cfg(not(feature = "tee"))]
+        let initial_execution_state = {
+            let mut vmm = _vmm.lock().expect("Poisoned VMM mutex");
+            if !self.start_paused {
+                vmm.resume_vcpus()
+                    .map_err(|e| Error::Build(BuildError::Start(format!("resume_vcpus: {e:?}"))))?;
+            }
+            public_execution_state(vmm.execution_state())
+        };
+        #[cfg(feature = "tee")]
         _vmm.lock()
             .expect("Poisoned VMM mutex")
             .resume_vcpus()
             .map_err(|e| Error::Build(BuildError::Start(format!("resume_vcpus: {e:?}"))))?;
+        #[cfg(not(feature = "tee"))]
+        trace.mark(if self.start_paused {
+            "vcpus.activation_gated"
+        } else {
+            "vcpus.resumed"
+        });
+        #[cfg(feature = "tee")]
         trace.mark("vcpus.resumed");
+
+        #[cfg(not(feature = "tee"))]
+        {
+            self.vmm_control.publish_vmm(&_vmm, initial_execution_state);
+        }
 
         // Register user exit observers
         {
@@ -601,6 +920,150 @@ impl Vm {
     }
 }
 
+#[cfg(not(feature = "tee"))]
+impl VmControlRegistry {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(VmControlRegistryState {
+                vmm: None,
+                execution: None,
+                transitioning: false,
+            }),
+            state_changed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Publishes the control handle and its already-established initial execution boundary atomically.
+    fn publish_vmm(&self, vmm: &Arc<std::sync::Mutex<vmm::Vmm>>, execution: VmExecutionState) {
+        let mut state = self.state.lock().expect("Poisoned VMM control registry");
+        state.vmm = Some(Arc::downgrade(vmm));
+        state.execution = Some(execution);
+        state.transitioning = false;
+        self.state_changed.notify_all();
+    }
+
+    /// Makes an in-flight barrier externally conservative until its final state is known.
+    fn publish_transition_started(&self) {
+        let mut state = self.state.lock().expect("Poisoned VMM control registry");
+        state.execution = Some(VmExecutionState::Indeterminate);
+        state.transitioning = true;
+        self.state_changed.notify_all();
+    }
+
+    /// Mirrors a completed or indeterminate execution transition before notifying observers.
+    fn publish_execution_state(&self, execution: VmExecutionState) {
+        let mut state = self.state.lock().expect("Poisoned VMM control registry");
+        state.execution = Some(execution);
+        state.transitioning = false;
+        self.state_changed.notify_all();
+    }
+
+    fn execution_state(&self) -> Option<VmExecutionState> {
+        let state = self.state.lock().ok()?;
+        state.vmm.as_ref()?.upgrade()?;
+        state.execution
+    }
+
+    fn running_vmm(&self) -> Result<Arc<std::sync::Mutex<vmm::Vmm>>> {
+        self.state
+            .lock()
+            .map_err(|_| {
+                Error::Runtime(RuntimeError::Control(
+                    "VMM control registry is poisoned".to_string(),
+                ))
+            })?
+            .vmm
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(Error::Runtime(RuntimeError::NotStarted))
+    }
+
+    fn wait_until_running(&self, timeout: Duration) -> Result<VmExecutionState> {
+        let started = Instant::now();
+        let mut state = self.state.lock().map_err(|_| {
+            Error::Runtime(RuntimeError::Control(
+                "VMM control registry is poisoned".to_string(),
+            ))
+        })?;
+
+        loop {
+            match state.execution {
+                Some(running @ VmExecutionState::Running { .. }) => return Ok(running),
+                Some(VmExecutionState::Indeterminate) if !state.transitioning => {
+                    return Err(Error::Runtime(RuntimeError::Control(
+                        "VM execution state became indeterminate while waiting for Running"
+                            .to_string(),
+                    )));
+                }
+                Some(VmExecutionState::Paused(_))
+                | Some(VmExecutionState::Indeterminate)
+                | None => {}
+            }
+
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return Err(wait_until_running_timeout(timeout, state.execution));
+            };
+            let (next_state, wait) =
+                self.state_changed
+                    .wait_timeout(state, remaining)
+                    .map_err(|_| {
+                        Error::Runtime(RuntimeError::Control(
+                            "VMM control registry is poisoned".to_string(),
+                        ))
+                    })?;
+            state = next_state;
+
+            // Check the predicate once more at the deadline so a simultaneous notification wins.
+            if wait.timed_out()
+                && !matches!(state.execution, Some(VmExecutionState::Running { .. }))
+            {
+                return Err(wait_until_running_timeout(timeout, state.execution));
+            }
+        }
+    }
+
+    fn wait_until_paused(&self, timeout: Duration) -> Result<VmExecutionState> {
+        let started = Instant::now();
+        let mut state = self.state.lock().map_err(|_| {
+            Error::Runtime(RuntimeError::Control(
+                "VMM control registry is poisoned".to_string(),
+            ))
+        })?;
+
+        loop {
+            match state.execution {
+                Some(paused @ VmExecutionState::Paused(_)) => return Ok(paused),
+                Some(VmExecutionState::Indeterminate) if !state.transitioning => {
+                    return Err(Error::Runtime(RuntimeError::Control(
+                        "VM execution state became indeterminate while waiting for Paused"
+                            .to_string(),
+                    )));
+                }
+                Some(VmExecutionState::Running { .. })
+                | Some(VmExecutionState::Indeterminate)
+                | None => {}
+            }
+
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                return Err(wait_until_paused_timeout(timeout, state.execution));
+            };
+            let (next_state, wait) =
+                self.state_changed
+                    .wait_timeout(state, remaining)
+                    .map_err(|_| {
+                        Error::Runtime(RuntimeError::Control(
+                            "VMM control registry is poisoned".to_string(),
+                        ))
+                    })?;
+            state = next_state;
+
+            if wait.timed_out() && !matches!(state.execution, Some(VmExecutionState::Paused(_))) {
+                return Err(wait_until_paused_timeout(timeout, state.execution));
+            }
+        }
+    }
+}
+
 struct BootTrace {
     enabled: bool,
     scope: &'static str,
@@ -639,6 +1102,33 @@ impl BootTrace {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(not(feature = "tee"))]
+fn public_execution_state(state: vmm::VmmExecutionState) -> VmExecutionState {
+    match state {
+        vmm::VmmExecutionState::Paused(generation) => {
+            VmExecutionState::Paused(VmPauseGeneration(generation))
+        }
+        vmm::VmmExecutionState::Running { resumed_from } => VmExecutionState::Running {
+            resumed_from: VmPauseGeneration(resumed_from),
+        },
+        vmm::VmmExecutionState::Indeterminate => VmExecutionState::Indeterminate,
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+fn wait_until_running_timeout(timeout: Duration, state: Option<VmExecutionState>) -> Error {
+    Error::Runtime(RuntimeError::Control(format!(
+        "timed out after {timeout:?} waiting for VM to reach Running; last state: {state:?}"
+    )))
+}
+
+#[cfg(not(feature = "tee"))]
+fn wait_until_paused_timeout(timeout: Duration, state: Option<VmExecutionState>) -> Error {
+    Error::Runtime(RuntimeError::Control(format!(
+        "timed out after {timeout:?} waiting for VM to reach Paused; last state: {state:?}"
+    )))
+}
 
 /// Bindings to libkrunfw functions.
 struct KrunfwBindings {
@@ -727,6 +1217,61 @@ mod tests {
             #[cfg(not(target_os = "windows"))]
             None,
         )
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn execution_control_is_unavailable_before_vmm_startup() {
+        let control = make_vm().control_handle();
+
+        assert_eq!(control.execution_state(), None);
+        assert!(matches!(
+            control.pause(),
+            Err(Error::Runtime(RuntimeError::NotStarted))
+        ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn waiting_for_running_times_out_before_vmm_startup() {
+        let control = make_vm().control_handle();
+
+        let error = control
+            .wait_until_running(Duration::from_millis(1))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Runtime(RuntimeError::Control(message))
+                if message.contains("timed out") && message.contains("last state: None")
+        ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn waiting_for_paused_times_out_before_vmm_startup() {
+        let control = make_vm().control_handle();
+
+        let error = control
+            .wait_until_paused(Duration::from_millis(1))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Runtime(RuntimeError::Control(message))
+                if message.contains("timed out") && message.contains("last state: None")
+        ));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn initial_pause_gate_is_explicit_and_disabled_by_default() {
+        let mut vm = make_vm();
+        assert!(!vm.start_paused);
+
+        vm.set_start_paused(true);
+
+        assert!(vm.start_paused);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -902,10 +1447,403 @@ mod tests {
         assert!(!flags.contains(TsiFlags::HIJACK_INET));
         assert!(!flags.contains(TsiFlags::HIJACK_UNIX));
     }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn restore_coverage_coalesces_chunks_and_overlays() {
+        let range =
+            |start, length| vmm::memory_state::GuestMemoryRange::new(start, length).unwrap();
+        assert_eq!(
+            merge_restore_ranges(vec![
+                range(0x2000, 0x1000),
+                range(0x1000, 0x1000),
+                range(0x1800, 0x1000),
+                range(0x5000, 0x1000),
+            ]),
+            vec![range(0x1000, 0x2000), range(0x5000, 0x1000)]
+        );
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl VmMemoryRestoreTarget for VmmMemoryRestoreTarget<'_> {
+    fn write_bytes(
+        &mut self,
+        range: vmm::memory_state::GuestMemoryRange,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        self.vmm
+            .materialize_memory(range, bytes)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.restored.push(range);
+        Ok(())
+    }
+
+    fn write_zero(&mut self, range: vmm::memory_state::GuestMemoryRange) -> io::Result<()> {
+        self.vmm
+            .materialize_zero_memory(range)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.restored.push(range);
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl<'a> VmmMemoryRestoreTarget<'a> {
+    fn new(vmm: &'a mut vmm::Vmm) -> Self {
+        let expected = vmm
+            .guest_memory()
+            .iter()
+            .map(|region| {
+                vmm::memory_state::GuestMemoryRange::new(
+                    region.start_addr().raw_value(),
+                    region.len(),
+                )
+                .expect("constructed guest-memory regions are non-empty and bounded")
+            })
+            .collect::<Vec<_>>();
+        let expected = merge_restore_ranges(expected);
+        Self {
+            vmm,
+            expected,
+            restored: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> io::Result<()> {
+        if merge_restore_ranges(self.restored) != self.expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "restore source did not materialize the complete guest-memory topology",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+fn merge_restore_ranges(
+    mut ranges: Vec<vmm::memory_state::GuestMemoryRange>,
+) -> Vec<vmm::memory_state::GuestMemoryRange> {
+    ranges.sort_unstable_by_key(|range| range.start());
+    let mut merged: Vec<vmm::memory_state::GuestMemoryRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut() {
+            if range.start() <= previous.end() {
+                *previous = vmm::memory_state::GuestMemoryRange::new(
+                    previous.start(),
+                    previous.end().max(range.end()) - previous.start(),
+                )
+                .expect("merged restore ranges remain non-empty and bounded");
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    merged
 }
 
 #[cfg(not(feature = "tee"))]
 impl VmControl {
+    /// Pauses every vCPU at one generation-correlated execution boundary.
+    pub fn pause(&self) -> Result<VmPauseGeneration> {
+        let vmm = self.running_vmm()?;
+        let result = {
+            let mut vmm = vmm.lock().map_err(|_| {
+                Error::Runtime(RuntimeError::Control("VMM mutex is poisoned".to_string()))
+            })?;
+            if matches!(
+                vmm.execution_state(),
+                vmm::VmmExecutionState::Running { .. }
+            ) {
+                self.vmm.publish_transition_started();
+            }
+            let result = vmm.pause_vcpus();
+            let execution = public_execution_state(vmm.execution_state());
+            // Publish before releasing the VMM mutex so concurrent barriers cannot reorder states.
+            self.vmm.publish_execution_state(execution);
+            result
+        };
+        result
+            .map(VmPauseGeneration)
+            .map_err(|error| Error::Runtime(RuntimeError::Control(error.to_string())))
+    }
+
+    /// Resumes every vCPU only from the named pause generation.
+    pub fn resume(&self, generation: VmPauseGeneration) -> Result<()> {
+        let vmm = self.running_vmm()?;
+        let result = {
+            let mut vmm = vmm.lock().map_err(|_| {
+                Error::Runtime(RuntimeError::Control("VMM mutex is poisoned".to_string()))
+            })?;
+            if matches!(
+                vmm.execution_state(),
+                vmm::VmmExecutionState::Paused(current) if current == generation.0
+            ) {
+                self.vmm.publish_transition_started();
+            }
+            let result = vmm.resume_vcpus_from(generation.0);
+            let execution = public_execution_state(vmm.execution_state());
+            // Publish before releasing the VMM mutex so concurrent barriers cannot reorder states.
+            self.vmm.publish_execution_state(execution);
+            result
+        };
+        result.map_err(|error| Error::Runtime(RuntimeError::Control(error.to_string())))
+    }
+
+    /// Returns the current execution boundary, or `None` before VMM startup completes.
+    pub fn execution_state(&self) -> Option<VmExecutionState> {
+        self.vmm.execution_state()
+    }
+
+    /// Blocks until every vCPU has acknowledged a running boundary.
+    ///
+    /// Unlike repeatedly calling [`execution_state`](Self::execution_state), this wait sleeps on a
+    /// runtime notification and therefore introduces no fixed polling interval. It works both for
+    /// initial VM startup and for a later transition out of [`VmExecutionState::Paused`].
+    pub fn wait_until_running(&self, timeout: Duration) -> Result<VmExecutionState> {
+        self.vmm.wait_until_running(timeout)
+    }
+
+    /// Blocks until the constructed VMM publishes a confirmed paused boundary.
+    ///
+    /// Restore coordinators use this with [`Vm::set_start_paused`] to finish activation work
+    /// without polling or allowing a guest instruction to run first.
+    pub fn wait_until_paused(&self, timeout: Duration) -> Result<VmExecutionState> {
+        self.vmm.wait_until_paused(timeout)
+    }
+
+    /// Captures the exact backend execution state at the current paused boundary.
+    pub fn capture_execution_state(&self) -> Result<vmm::execution_state::ExecutionState> {
+        self.with_running_vmm(vmm::Vmm::capture_execution_state)
+    }
+
+    /// Captures one virtio-block device and parks it until this VM is resumed.
+    #[cfg(feature = "blk")]
+    pub fn capture_block_device_state(
+        &self,
+        device_id: &str,
+    ) -> Result<vmm::device_state::BlockDeviceState> {
+        self.with_running_vmm(|vmm| vmm.capture_block_device_state(device_id))
+    }
+
+    /// Returns the deterministic logical inventory of registered virtio-mmio devices.
+    #[cfg(feature = "blk")]
+    pub fn virtio_device_inventory(&self) -> Result<Vec<(u32, String)>> {
+        self.with_running_vmm(|vmm| Ok(vmm.virtio_device_inventory()))
+    }
+
+    /// Reports whether one configured virtio device supports reversible queue quiescence.
+    #[cfg(feature = "blk")]
+    pub fn virtio_device_supports_quiesce(
+        &self,
+        device_type: u32,
+        device_id: &str,
+    ) -> Result<bool> {
+        self.with_running_vmm(|vmm| vmm.virtio_device_supports_quiesce(device_type, device_id))
+    }
+
+    /// Captures one quiesce-capable destination-recreated virtio device.
+    #[cfg(feature = "blk")]
+    pub fn capture_virtio_device_state(
+        &self,
+        device_type: u32,
+        device_id: &str,
+    ) -> Result<vmm::device_state::VirtioDeviceState> {
+        self.with_running_vmm(|vmm| vmm.capture_virtio_device_state(device_type, device_id))
+    }
+
+    /// Restores one destination-recreated virtio device before resuming the paused VM.
+    #[cfg(feature = "blk")]
+    pub fn restore_virtio_device_state(
+        &self,
+        state: &vmm::device_state::VirtioDeviceState,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.restore_virtio_device_state(state))
+    }
+
+    /// Restores one parked virtio-block device before resuming the paused VM.
+    #[cfg(feature = "blk")]
+    pub fn restore_block_device_state(
+        &self,
+        device_id: &str,
+        state: &vmm::device_state::BlockDeviceState,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.restore_block_device_state(device_id, state))
+    }
+
+    /// Replaces one parked block backend with an already opened, compatible chain.
+    #[cfg(feature = "blk")]
+    pub fn replace_block_backend(
+        &self,
+        device_id: &str,
+        backend: devices::virtio::PreparedBlockBackend,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.replace_block_backend(device_id, backend))
+    }
+
+    /// Grows an exclusively owned writable block device at a paused queue boundary.
+    /// The image and virtio capacity change; guest filesystem expansion remains the caller's job.
+    /// Persist recovery intent first and recover forward if this returns an I/O error.
+    #[cfg(feature = "blk")]
+    pub fn grow_block_capacity(&self, device_id: &str, size_bytes: u64) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.grow_block_capacity(device_id, size_bytes))
+    }
+
+    /// Plans a complete memory generation while the VM is paused.
+    pub fn plan_full_memory_capture(&self) -> Result<vmm::memory_state::MemoryCapturePlan> {
+        self.with_running_vmm(vmm::Vmm::plan_full_memory_capture)
+    }
+
+    /// Plans a memory delta relative to the latest retained baseline.
+    pub fn plan_incremental_memory_capture(
+        &self,
+        baseline: vmm::memory_state::MemoryBaselineToken,
+    ) -> Result<vmm::memory_state::IncrementalCaptureDecision> {
+        self.with_running_vmm(|vmm| vmm.plan_incremental_memory_capture(baseline))
+    }
+
+    /// Plans a delta with a caller-selected complete-capture crossover percentage.
+    pub fn plan_incremental_memory_capture_with_threshold(
+        &self,
+        baseline: vmm::memory_state::MemoryBaselineToken,
+        max_dirty_percent: u64,
+    ) -> Result<vmm::memory_state::IncrementalCaptureDecision> {
+        self.with_running_vmm(|vmm| {
+            vmm.plan_incremental_memory_capture_with_threshold(baseline, max_dirty_percent)
+        })
+    }
+
+    /// Streams one pending complete or incremental memory generation.
+    pub fn capture_memory(
+        &self,
+        capture: &vmm::memory_state::MemoryCapturePlan,
+        options: vmm::memory_state::MemoryCaptureOptions,
+        sink: &mut dyn vmm::memory_state::MemoryCaptureSink,
+    ) -> Result<vmm::memory_state::MemoryCaptureStats> {
+        self.with_running_vmm(|vmm| vmm.capture_memory(capture, options, sink))
+    }
+
+    /// Accepts a memory generation after its durable objects and manifest are published.
+    pub fn publish_memory_capture(
+        &self,
+        capture: &vmm::memory_state::MemoryCapturePlan,
+    ) -> Result<vmm::memory_state::MemoryBaselineToken> {
+        self.with_running_vmm(|vmm| vmm.publish_memory_capture(capture))
+    }
+
+    /// Abandons a failed candidate while preserving its dirty coverage for retry.
+    pub fn abandon_memory_capture(
+        &self,
+        capture: &vmm::memory_state::MemoryCapturePlan,
+    ) -> Result<()> {
+        self.with_running_vmm(|vmm| vmm.abandon_memory_capture(capture))
+    }
+
+    /// Releases the retained baseline and removes backend dirty-tracking overhead.
+    pub fn release_memory_baseline(&self) -> Result<()> {
+        self.with_running_vmm(vmm::Vmm::release_memory_baseline)
+    }
+
+    /// Returns the currently retained runtime-local memory baseline.
+    pub fn retained_memory_baseline(&self) -> Option<vmm::memory_state::MemoryBaselineToken> {
+        let vmm = self.vmm.running_vmm().ok()?;
+        let baseline = vmm.lock().ok()?.retained_memory_baseline();
+        baseline
+    }
+
+    /// Whether this VM was constructed with the VM-generation transport.
+    ///
+    /// Use [`vm_generation_state`](Self::vm_generation_state) after boot to distinguish transport
+    /// presence from a bundled or custom kernel that actually bound the guest driver.
+    pub fn vm_generation_transport_present(&self) -> bool {
+        self.generation.is_some()
+    }
+
+    /// Publish a fresh VM generation and signal the guest driver.
+    ///
+    /// The caller must generate `id` with its operating-system CSPRNG and persist it with the
+    /// restore attempt. Returning `None` means the transport is absent or its sequence space was
+    /// exhausted. Clone/rollback activation must fail closed in either case.
+    pub fn install_vm_generation_id(&self, id: VmGenerationId) -> Option<VmGenerationRequest> {
+        let generation = self.generation.as_ref()?;
+        let sequence = generation.lock().unwrap().install(id)?;
+        Some(VmGenerationRequest { sequence, id })
+    }
+
+    /// Publish one identity-and-clock activation; unsupported guest kernels return `None`.
+    ///
+    /// The guest reads fresh host time during processing, not the time when this request was
+    /// installed. A processed acknowledgement covers both the identity and the clock update.
+    pub fn install_vm_generation_and_clock(
+        &self,
+        id: VmGenerationId,
+    ) -> Option<VmGenerationRequest> {
+        let generation = self.generation.as_ref()?;
+        let sequence = generation.lock().unwrap().install_with_clock(id)?;
+        Some(VmGenerationRequest { sequence, id })
+    }
+
+    /// Whether the bound guest kernel supports wall-clock correction without clone semantics.
+    pub fn clock_sync_supported(&self) -> bool {
+        self.generation
+            .as_ref()
+            .is_some_and(|generation| generation.lock().unwrap().clock_only_supported())
+    }
+
+    /// Request wall-clock correction for ordinary pause/resume without rotating VM identity.
+    ///
+    /// Resume vCPUs to let the kernel process this request, then wait through
+    /// [`Self::wait_vm_generation_processed`] before thawing user workloads. `None` means the
+    /// guest lacks the capability, an identity activation is pending, or requests are exhausted.
+    pub fn request_clock_sync(&self) -> Option<VmGenerationRequest> {
+        let (sequence, id) = self
+            .generation
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .request_clock_sync()?;
+        Some(VmGenerationRequest { sequence, id })
+    }
+
+    /// Wait without polling for the guest kernel to process one exact generation request.
+    pub fn wait_vm_generation_processed(
+        &self,
+        request: VmGenerationRequest,
+        timeout: Duration,
+    ) -> Option<VmGenerationWaitOutcome> {
+        let generation = self.generation.as_ref()?;
+        let processing = generation.lock().unwrap().processing_handle();
+        let outcome = processing.wait_processed(request.sequence, request.id, timeout);
+        Some(match outcome {
+            devices::virtio::GenerationWaitOutcome::Processed => VmGenerationWaitOutcome::Processed,
+            devices::virtio::GenerationWaitOutcome::Superseded => {
+                VmGenerationWaitOutcome::Superseded
+            }
+            devices::virtio::GenerationWaitOutcome::TimedOut => VmGenerationWaitOutcome::TimedOut,
+            devices::virtio::GenerationWaitOutcome::Failed => VmGenerationWaitOutcome::Failed,
+        })
+    }
+
+    /// Return the latest request and guest-kernel acknowledgement.
+    pub fn vm_generation_state(&self) -> Option<VmGenerationState> {
+        let generation = self.generation.as_ref()?;
+        let snapshot = generation.lock().unwrap().state_snapshot();
+        Some(VmGenerationState {
+            driver_ready: snapshot.driver_ready,
+            driver_error: snapshot.driver_error,
+            clock_sync_supported: snapshot.clock_sync_supported,
+            requested: (snapshot.request_sequence != 0).then_some(VmGenerationRequest {
+                sequence: snapshot.request_sequence,
+                id: snapshot.requested_id,
+            }),
+            processed: (snapshot.processed_sequence != 0).then_some(VmGenerationRequest {
+                sequence: snapshot.processed_sequence,
+                id: snapshot.processed_id,
+            }),
+        })
+    }
+
     /// Whether the running VM can resize memory live.
     pub fn memory_resize_supported(&self) -> bool {
         self.mem.is_some()
@@ -962,5 +1900,21 @@ impl VmControl {
             current_mib: self.boot_mib + (snap.plugged_size >> 20),
             max_mib: self.boot_mib + (snap.region_size >> 20),
         })
+    }
+
+    fn running_vmm(&self) -> Result<Arc<std::sync::Mutex<vmm::Vmm>>> {
+        self.vmm.running_vmm()
+    }
+
+    fn with_running_vmm<T>(
+        &self,
+        operation: impl FnOnce(&mut vmm::Vmm) -> vmm::Result<T>,
+    ) -> Result<T> {
+        let vmm = self.running_vmm()?;
+        let mut vmm = vmm.lock().map_err(|_| {
+            Error::Runtime(RuntimeError::Control("VMM mutex is poisoned".to_string()))
+        })?;
+        operation(&mut vmm)
+            .map_err(|error| Error::Runtime(RuntimeError::Control(error.to_string())))
     }
 }

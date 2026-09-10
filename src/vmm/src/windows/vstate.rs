@@ -12,13 +12,16 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
+use super::super::{VcpuControlRequestId, VCPU_CONTROL_MAILBOX_CAPACITY};
+use crate::memory_state::GuestMemoryRange;
 use crate::vmm_config::machine_config::{CpuFeaturesTemplate, HostCpuId};
 
 use crate::resources::VcpuPlacementResult;
 use arch::ArchMemoryInfo;
 #[cfg(target_arch = "x86_64")]
 use crossbeam_channel::RecvTimeoutError;
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
+use serde::{Deserialize, Serialize};
 use utils::{eventfd::EventFd, metrics::MetricsWriter};
 #[cfg(target_arch = "x86_64")]
 use vm_memory::Bytes;
@@ -29,18 +32,19 @@ use windows_sys::Win32::Foundation::{E_FAIL, E_INVALIDARG, S_OK};
 use windows_sys::Win32::System::Hypervisor::{
     WHvCancelRunVirtualProcessor, WHvCapabilityCodeHypervisorPresent, WHvCreatePartition,
     WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor, WHvGetCapability,
-    WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
-    WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeProcessorCount,
+    WHvGetVirtualProcessorRegisters, WHvGetVirtualProcessorState, WHvMapGpaRange,
+    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagTrackDirtyPages,
+    WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeProcessorCount, WHvQueryGpaRangeDirtyBitmap,
     WHvRunVirtualProcessor, WHvRunVpExitReasonNone, WHvSetPartitionProperty,
-    WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvUnmapGpaRange, WHV_CAPABILITY,
-    WHV_MAP_GPA_RANGE_FLAGS, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
-    WHV_RUN_VP_EXIT_REASON,
+    WHvSetVirtualProcessorRegisters, WHvSetVirtualProcessorState, WHvSetupPartition,
+    WHvUnmapGpaRange, WHV_CAPABILITY, WHV_MAP_GPA_RANGE_FLAGS, WHV_PARTITION_HANDLE,
+    WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_REASON,
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Hypervisor::{
-    WHvCapabilityCodeExtendedVmExits, WHvCapabilityCodeProcessorClockFrequency,
-    WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvRegisterInternalActivityState, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
+    WHvCapabilityCodeExtendedVmExits, WHvPartitionPropertyCodeExtendedVmExits,
+    WHvPartitionPropertyCodeLocalApicEmulationMode, WHvRegisterInternalActivityState,
+    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonMemoryAccess,
     WHvRunVpExitReasonX64ApicInitSipiTrap, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
     WHvRunVpExitReasonX64IoPortAccess, WHvTranslateGva, WHvTranslateGvaResultSuccess,
     WHvX64LocalApicEmulationModeXApic, WHvX64RegisterApicId, WHvX64RegisterCr0, WHvX64RegisterCr2,
@@ -60,6 +64,10 @@ use windows_sys::Win32::System::Threading::GetThreadGroupAffinity;
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, GetThreadTimes, SetThreadGroupAffinity,
 };
+
+#[cfg(target_arch = "x86_64")]
+#[path = "x86_state.rs"]
+mod x86_state;
 
 #[cfg(target_arch = "aarch64")]
 const AARCH64_PSR_MODE_EL1H: u64 = 0x0000_0005;
@@ -109,6 +117,37 @@ const WHV_ARM64_REGISTER_PSTATE: WHV_REGISTER_NAME = 0x0002_0023;
 const WHV_ARM64_REGISTER_MPIDR_EL1: WHV_REGISTER_NAME = 0x0004_0001;
 #[cfg(target_arch = "aarch64")]
 const WHV_ARM64_REGISTER_GICR_BASE_GPA: WHV_REGISTER_NAME = 0x0006_3000;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_GENERAL_END: WHV_REGISTER_NAME = 0x0002_0023;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_Q0: WHV_REGISTER_NAME = 0x0003_0000;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_Q31: WHV_REGISTER_NAME = 0x0003_001f;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_FPCR: WHV_REGISTER_NAME = 0x0004_0012;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_FPSR: WHV_REGISTER_NAME = 0x0004_0013;
+// windows-sys exposes the x86 identifier under the unqualified name. ARM64
+// uses a different ABI value (WinHvPlatformDefs.h); bit 0 is StartupSuspend.
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_ACTIVITY: WHV_REGISTER_NAME = 0x0000_0004;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_CNTV_CTL: WHV_REGISTER_NAME = 0x0005_800e;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_CNTV_CVAL: WHV_REGISTER_NAME = 0x0005_800f;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_ID_AA64PFR0_EL1: WHV_REGISTER_NAME = 0x0002_2020;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_REGISTER_ID_AA64DFR0_EL1: WHV_REGISTER_NAME = 0x0002_2028;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_VP_STATE_INTERRUPT_CONTROLLER: i32 = 0x8000_0000_u32 as i32;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_VP_STATE_GLOBAL_INTERRUPT: i32 = 0xc000_0006_u32 as i32;
+#[cfg(target_arch = "aarch64")]
+const WHV_ARM64_VP_STATE_SVE: i32 = 0x8000_0007_u32 as i32;
+#[cfg(target_arch = "aarch64")]
+const WHV_ANY_VP: u32 = u32::MAX;
+const MAX_WHP_OPAQUE_STATE_SIZE: usize = 16 * 1024 * 1024;
 #[cfg(target_arch = "aarch64")]
 const WHV_ARM64_EXIT_REASON_UNMAPPED_GPA: WHV_RUN_VP_EXIT_REASON = 0x8000_0000_u32 as i32;
 #[cfg(target_arch = "aarch64")]
@@ -238,6 +277,12 @@ pub enum Error {
         size: u64,
         hresult: windows_sys::core::HRESULT,
     },
+    QueryDirtyBitmap {
+        guest_addr: u64,
+        size: u64,
+        hresult: windows_sys::core::HRESULT,
+    },
+    DirtyTrackingInactive,
     NotImplemented(&'static str),
     RunVirtualProcessor {
         id: u8,
@@ -247,12 +292,24 @@ pub enum Error {
         id: u8,
         hresult: windows_sys::core::HRESULT,
     },
+    GetVirtualProcessorState {
+        id: u32,
+        state_type: i32,
+        hresult: windows_sys::core::HRESULT,
+    },
     #[cfg(target_arch = "x86_64")]
     ApicInitSipiTrapUnsupported,
     SetVirtualProcessorRegisters {
         id: u8,
         hresult: windows_sys::core::HRESULT,
     },
+    SetVirtualProcessorState {
+        id: u32,
+        state_type: i32,
+        hresult: windows_sys::core::HRESULT,
+    },
+    StateCodec(String),
+    StateTooLarge,
     SetPartitionProperty {
         property: i32,
         hresult: windows_sys::core::HRESULT,
@@ -359,6 +416,16 @@ impl Display for Error {
                 "WHvMapGpaRange(guest_addr=0x{guest_addr:x}, size=0x{size:x}) failed with HRESULT 0x{:08x}",
                 *hresult as u32
             ),
+            Error::QueryDirtyBitmap {
+                guest_addr,
+                size,
+                hresult,
+            } => write!(
+                f,
+                "WHvQueryGpaRangeDirtyBitmap(guest_addr=0x{guest_addr:x}, size=0x{size:x}) failed with HRESULT 0x{:08x}",
+                *hresult as u32
+            ),
+            Error::DirtyTrackingInactive => write!(f, "WHP dirty tracking is not active"),
             Error::NotImplemented(feature) => {
                 write!(f, "WHP backend support is not implemented yet: {feature}")
             }
@@ -372,6 +439,15 @@ impl Display for Error {
                 "WHvGetVirtualProcessorRegisters({id}) failed with HRESULT 0x{:08x}",
                 *hresult as u32
             ),
+            Error::GetVirtualProcessorState {
+                id,
+                state_type,
+                hresult,
+            } => write!(
+                f,
+                "WHvGetVirtualProcessorState({id}, {state_type:#x}) failed with HRESULT 0x{:08x}",
+                *hresult as u32
+            ),
             #[cfg(target_arch = "x86_64")]
             Error::ApicInitSipiTrapUnsupported => write!(
                 f,
@@ -383,6 +459,17 @@ impl Display for Error {
                 "WHvSetVirtualProcessorRegisters({id}) failed with HRESULT 0x{:08x}",
                 *hresult as u32
             ),
+            Error::SetVirtualProcessorState {
+                id,
+                state_type,
+                hresult,
+            } => write!(
+                f,
+                "WHvSetVirtualProcessorState({id}, {state_type:#x}) failed with HRESULT 0x{:08x}",
+                *hresult as u32
+            ),
+            Error::StateCodec(error) => write!(f, "WHP execution-state codec failed: {error}"),
+            Error::StateTooLarge => write!(f, "WHP execution-state payload exceeds its limit"),
             Error::SetPartitionProperty { property, hresult } => write!(
                 f,
                 "WHvSetPartitionProperty({property}) failed with HRESULT 0x{:08x}",
@@ -424,6 +511,21 @@ pub struct WhpCapabilities {
 pub struct Vm {
     partition: Partition,
     memory_regions: Vec<MappedMemoryRegion>,
+    dirty_tracking: bool,
+    dirty_tracking_transition_incomplete: bool,
+    #[cfg(target_arch = "aarch64")]
+    paused_timers: Vec<Arm64TimerState>,
+    #[cfg(target_arch = "x86_64")]
+    sipi_router: Arc<ApStartupRouter>,
+    #[cfg(target_arch = "x86_64")]
+    time_suspended: bool,
+}
+
+#[cfg(target_arch = "aarch64")]
+struct Arm64TimerState {
+    id: u8,
+    deadline: u64,
+    control: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -455,6 +557,21 @@ pub struct Vcpu {
     response_receiver: Option<Receiver<VcpuResponse>>,
 }
 
+#[cfg(target_arch = "aarch64")]
+#[derive(Deserialize, Serialize)]
+struct WhpVcpuExecutionState {
+    registers: Vec<(WHV_REGISTER_NAME, [u8; 16])>,
+    interrupt_controller: Vec<u8>,
+    optional_sve: Option<Vec<u8>>,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Deserialize, Serialize)]
+struct WhpArmVmExecutionState {
+    counter_frequency: u64,
+    interrupt_controller: Vec<u8>,
+}
+
 /// Boot-time state of an x86 application processor under WHP.
 ///
 /// WHP's in-hypervisor local APIC emulation does not start APs itself: an
@@ -462,7 +579,7 @@ pub struct Vcpu {
 /// VMM must apply the INIT/SIPI to the targets. APs therefore stay parked
 /// (architectural reset state, never entered) until a startup IPI arrives.
 #[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ApParkState {
     /// Waiting for a startup IPI; the vCPU thread has not entered the guest.
     Parked,
@@ -553,25 +670,49 @@ impl ApStartupRouter {
     fn wait_for_sipi(
         &self,
         id: u8,
+        partition_handle: WHV_PARTITION_HANDLE,
         event_receiver: &Receiver<VcpuEvent>,
         response_sender: &Sender<VcpuResponse>,
-    ) -> result::Result<u8, ()> {
+    ) -> result::Result<Option<u8>, ()> {
         let slot = &self.slots[id as usize];
         loop {
             {
                 let mut state = slot.lock().unwrap();
+                // A restored AP already has its execution registers installed.
+                // Do not apply a synthetic SIPI and overwrite its resumed PC.
+                if *state == ApParkState::Running {
+                    return Ok(None);
+                }
                 if let ApParkState::SipiPending(vector) = *state {
                     *state = ApParkState::Running;
                     debug!("WHP vCPU {id}: unparked by startup IPI (vector {vector:#x})");
-                    return Ok(vector);
+                    return Ok(Some(vector));
                 }
             }
             match event_receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok(VcpuEvent::Pause) => {
-                    let _ = response_sender.send(VcpuResponse::Paused);
+                Ok(VcpuEvent::Terminate) => return Err(()),
+                Ok(VcpuEvent::Pause { request_id }) => {
+                    let _ = response_sender.send(VcpuResponse::Paused { request_id });
+                    if wait_until_resumed(partition_handle, id, event_receiver, response_sender)
+                        .is_err()
+                    {
+                        return Err(());
+                    }
                 }
-                Ok(VcpuEvent::Resume) => {
-                    let _ = response_sender.send(VcpuResponse::Resumed);
+                Ok(VcpuEvent::Resume { request_id }) => {
+                    let _ = response_sender.send(VcpuResponse::Resumed { request_id });
+                }
+                Ok(VcpuEvent::CaptureState { request_id }) => {
+                    let result = capture_whp_vcpu_state(partition_handle, id)
+                        .map_err(|error| error.to_string());
+                    let _ =
+                        response_sender.send(VcpuResponse::StateCaptured { request_id, result });
+                }
+                Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
+                    let result = restore_whp_vcpu_state(partition_handle, id, &bytes)
+                        .map_err(|error| error.to_string());
+                    let _ =
+                        response_sender.send(VcpuResponse::StateRestored { request_id, result });
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Err(()),
@@ -583,14 +724,38 @@ impl ApStartupRouter {
 #[allow(unused)]
 #[derive(Debug)]
 pub enum VcpuEvent {
-    Pause,
-    Resume,
+    Terminate,
+    Pause {
+        request_id: VcpuControlRequestId,
+    },
+    Resume {
+        request_id: VcpuControlRequestId,
+    },
+    CaptureState {
+        request_id: VcpuControlRequestId,
+    },
+    RestoreState {
+        request_id: VcpuControlRequestId,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum VcpuResponse {
-    Paused,
-    Resumed,
+    Paused {
+        request_id: VcpuControlRequestId,
+    },
+    Resumed {
+        request_id: VcpuControlRequestId,
+    },
+    StateCaptured {
+        request_id: VcpuControlRequestId,
+        result: result::Result<Vec<u8>, String>,
+    },
+    StateRestored {
+        request_id: VcpuControlRequestId,
+        result: result::Result<(), String>,
+    },
     Exited(u8),
 }
 
@@ -698,6 +863,7 @@ struct WhvArm64ResetContext {
 
 #[derive(Clone, Copy, Debug)]
 struct MappedMemoryRegion {
+    host_addr: usize,
     guest_addr: u64,
     size: u64,
 }
@@ -751,6 +917,14 @@ impl Vm {
         Ok(Self {
             partition,
             memory_regions: Vec::new(),
+            dirty_tracking: false,
+            dirty_tracking_transition_incomplete: false,
+            #[cfg(target_arch = "aarch64")]
+            paused_timers: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            sipi_router: Arc::new(ApStartupRouter::new(vcpu_count)),
+            #[cfg(target_arch = "x86_64")]
+            time_suspended: false,
         })
     }
 
@@ -768,10 +942,274 @@ impl Vm {
                 guest_addr,
                 size,
             )?;
-            self.memory_regions
-                .push(MappedMemoryRegion { guest_addr, size });
+            self.memory_regions.push(MappedMemoryRegion {
+                host_addr: host_addr as usize,
+                guest_addr,
+                size,
+            });
         }
 
+        Ok(())
+    }
+
+    /// Starts a WHP CPU dirty generation for every ordinary guest-memory mapping.
+    ///
+    /// The caller must hold the VM-wide paused boundary while mappings are replaced.
+    pub fn begin_dirty_tracking(&mut self) -> Result<()> {
+        self.set_dirty_tracking(true)
+    }
+
+    /// Seals the current WHP CPU dirty generation and returns coalesced GPA ranges.
+    pub fn take_dirty_ranges(&mut self) -> Result<Vec<GuestMemoryRange>> {
+        const DIRTY_PAGE_SIZE: u64 = 4096;
+
+        if !self.dirty_tracking {
+            return Err(Error::DirtyTrackingInactive);
+        }
+
+        let mut ranges = Vec::new();
+        for region in &self.memory_regions {
+            let page_count = region.size.div_ceil(DIRTY_PAGE_SIZE);
+            let mut bitmap = vec![0_u64; page_count.div_ceil(64) as usize];
+            let bitmap_size = (bitmap.len() * size_of::<u64>()) as u32;
+            let hresult = unsafe {
+                WHvQueryGpaRangeDirtyBitmap(
+                    self.partition.handle,
+                    region.guest_addr,
+                    region.size,
+                    bitmap.as_mut_ptr(),
+                    bitmap_size,
+                )
+            };
+            if hresult < 0 {
+                return Err(Error::QueryDirtyBitmap {
+                    guest_addr: region.guest_addr,
+                    size: region.size,
+                    hresult,
+                });
+            }
+            bitmap_to_ranges(
+                region.guest_addr,
+                region.size,
+                DIRTY_PAGE_SIZE,
+                &bitmap,
+                &mut ranges,
+            );
+            // A zero-sized query is the documented explicit clear operation. Close this dirty
+            // generation after copying its bitmap so the next query reports only later writes.
+            let clear_result = unsafe {
+                WHvQueryGpaRangeDirtyBitmap(
+                    self.partition.handle,
+                    region.guest_addr,
+                    region.size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if clear_result < 0 {
+                return Err(Error::QueryDirtyBitmap {
+                    guest_addr: region.guest_addr,
+                    size: region.size,
+                    hresult: clear_result,
+                });
+            }
+        }
+        Ok(ranges)
+    }
+
+    /// Stops WHP dirty logging and restores ordinary executable writable mappings.
+    pub fn stop_dirty_tracking(&mut self) -> Result<()> {
+        self.set_dirty_tracking(false)
+    }
+
+    /// Captures partition-wide execution state that is not represented by vCPU registers.
+    #[cfg(target_arch = "aarch64")]
+    pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        let interrupt_controller = get_virtual_processor_state(
+            self.partition.handle,
+            WHV_ANY_VP,
+            WHV_ARM64_VP_STATE_GLOBAL_INTERRUPT,
+        )?;
+        let counter_frequency = host_tsc_frequency_hz()
+            .ok_or_else(|| Error::StateCodec("WHP counter frequency unavailable".into()))?;
+        bincode::serde::encode_to_vec(
+            WhpArmVmExecutionState {
+                counter_frequency,
+                interrupt_controller,
+            },
+            bincode::config::standard(),
+        )
+        .map_err(|error| Error::StateCodec(error.to_string()))
+    }
+
+    /// Restores partition-wide execution state before the partition first runs.
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
+        let (state, used): (WhpArmVmExecutionState, usize) = bincode::serde::decode_from_slice(
+            bytes,
+            bincode::config::standard().with_limit::<MAX_WHP_OPAQUE_STATE_SIZE>(),
+        )
+        .map_err(|error| Error::StateCodec(error.to_string()))?;
+        if used != bytes.len() || Some(state.counter_frequency) != host_tsc_frequency_hz() {
+            return Err(Error::StateCodec(
+                "WHP ARM64 counter frequency or VM state mismatch".into(),
+            ));
+        }
+        set_virtual_processor_state(
+            self.partition.handle,
+            WHV_ANY_VP,
+            WHV_ARM64_VP_STATE_GLOBAL_INTERRUPT,
+            &state.interrupt_controller,
+        )
+    }
+
+    /// Completes vCPU state on the controller thread, where WHP's opaque-state APIs are safe.
+    #[cfg(target_arch = "aarch64")]
+    pub fn complete_vcpu_execution_capture(
+        &self,
+        id: u32,
+        _worker_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        capture_whp_vcpu_state_on_controller(self.partition.handle, id)
+    }
+
+    /// Restores opaque and register state on the controller before the owning thread is released.
+    #[cfg(target_arch = "aarch64")]
+    pub fn prepare_vcpu_execution_restore(&mut self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+        let timer = restore_whp_vcpu_state_on_controller(self.partition.handle, id, bytes)?;
+        self.paused_timers.push(timer);
+        Ok(Vec::new())
+    }
+
+    /// Freezes virtual time only after every vCPU has acknowledged the pause.
+    #[cfg(target_arch = "aarch64")]
+    pub fn pause_execution_time(&mut self, vcpu_count: usize) -> Result<()> {
+        set_partition_time_running(self.partition.handle, false)?;
+        let mut timers = Vec::with_capacity(vcpu_count);
+        for id in 0..vcpu_count {
+            let id =
+                u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".into()))?;
+            timers.push(Arm64TimerState {
+                id,
+                deadline: get_vcpu_register_u64(
+                    self.partition.handle,
+                    id,
+                    WHV_ARM64_REGISTER_CNTV_CVAL,
+                )?,
+                control: get_vcpu_register_u64(
+                    self.partition.handle,
+                    id,
+                    WHV_ARM64_REGISTER_CNTV_CTL,
+                )? & 3,
+            });
+        }
+        self.paused_timers = timers;
+        Ok(())
+    }
+
+    /// Repairs WHP's deadline rebasing before any vCPU is allowed to run.
+    #[cfg(target_arch = "aarch64")]
+    pub fn resume_execution_time(&mut self) -> Result<()> {
+        if self.paused_timers.is_empty() {
+            return Ok(()); // Ordinary first boot has no saved timers.
+        }
+        set_partition_time_running(self.partition.handle, true)?;
+        for timer in &self.paused_timers {
+            // WHP adjusts CVAL when partition time starts. Restore CVAL only
+            // after that adjustment, with enable/mask last. ISTATUS is derived.
+            if let Err(error) = set_vcpu_registers(
+                self.partition.handle,
+                timer.id,
+                &[WHV_ARM64_REGISTER_CNTV_CVAL, WHV_ARM64_REGISTER_CNTV_CTL],
+                &[
+                    register_value_u64(timer.deadline),
+                    register_value_u64(timer.control),
+                ],
+            ) {
+                // The VMM remains indeterminate and releases no CPU on failure.
+                // Keep the saved timers available for explicit recovery.
+                let freeze = set_partition_time_running(self.partition.handle, false);
+                return Err(Error::StateCodec(format!(
+                    "timer activation failed: {error}; time freeze: {freeze:?}"
+                )));
+            }
+        }
+        self.paused_timers.clear();
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn capture_execution_state(&self) -> Result<Vec<u8>> {
+        x86_state::capture_vm(self.partition.handle, &self.sipi_router)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_execution_state(&mut self, bytes: &[u8]) -> Result<()> {
+        x86_state::restore_vm(self.partition.handle, &self.sipi_router, bytes)?;
+        self.time_suspended = true;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn complete_vcpu_execution_capture(
+        &self,
+        id: u32,
+        _worker_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        x86_state::capture_cpu(self.partition.handle, id)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn prepare_vcpu_execution_restore(&self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+        x86_state::restore_cpu(self.partition.handle, id, bytes)?;
+        Ok(Vec::new())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn sipi_router(&self) -> Arc<ApStartupRouter> {
+        self.sipi_router.clone()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn pause_execution_time(&mut self, _vcpu_count: usize) -> Result<()> {
+        set_partition_time_running(self.partition.handle, false)?;
+        self.time_suspended = true;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn resume_execution_time(&mut self) -> Result<()> {
+        if self.time_suspended {
+            set_partition_time_running(self.partition.handle, true)?;
+            self.time_suspended = false;
+        }
+        Ok(())
+    }
+
+    fn set_dirty_tracking(&mut self, enabled: bool) -> Result<()> {
+        if self.dirty_tracking == enabled && !self.dirty_tracking_transition_incomplete {
+            return Ok(());
+        }
+
+        // A failed mapping transition must be reconciled even when the remembered mode matches.
+        self.dirty_tracking_transition_incomplete = true;
+        for region in &self.memory_regions {
+            unmap_gpa_range(self.partition.handle, region.guest_addr, region.size)?;
+            let mut flags =
+                WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute;
+            if enabled {
+                flags |= WHvMapGpaRangeFlagTrackDirtyPages;
+            }
+            map_gpa_range_with_flags(
+                self.partition.handle,
+                region.host_addr as *const u8,
+                region.guest_addr,
+                region.size,
+                flags,
+            )?;
+        }
+        self.dirty_tracking = enabled;
+        self.dirty_tracking_transition_incomplete = false;
         Ok(())
     }
 
@@ -853,8 +1291,8 @@ impl Vcpu {
             return Err(Error::CreateVirtualProcessor { id, hresult });
         }
 
-        let (event_sender, event_receiver) = unbounded();
-        let (response_sender, response_receiver) = unbounded();
+        let (event_sender, event_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
+        let (response_sender, response_receiver) = bounded(VCPU_CONTROL_MAILBOX_CAPACITY);
 
         Ok(Self {
             id,
@@ -1203,16 +1641,20 @@ impl VcpuHandle {
     }
 
     pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
-        let should_cancel = matches!(event, VcpuEvent::Pause);
+        let should_cancel = matches!(event, VcpuEvent::Pause { .. } | VcpuEvent::Terminate);
         self.event_sender
             .as_ref()
             .expect("vCPU event sender missing before handle drop")
             .send(event)
             .expect("event sender channel closed on vcpu end.");
         if should_cancel {
-            cancel_run_virtual_processor(self.partition_handle, self.id)?;
+            self.kick()?;
         }
         Ok(())
+    }
+
+    pub fn kick(&self) -> Result<()> {
+        cancel_run_virtual_processor(self.partition_handle, self.id)
     }
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
@@ -1223,13 +1665,15 @@ impl VcpuHandle {
 impl Drop for VcpuHandle {
     fn drop(&mut self) {
         if self.partition_handle != 0 {
+            // Failed construction or restore can leave this thread either waiting at the initial
+            // pause boundary or executing WHvRunVirtualProcessor. Terminate is not a guest exit;
+            // cancellation only wakes the running case so it can consume the command.
+            if let Some(sender) = self.event_sender.as_ref() {
+                let _ = sender.send(VcpuEvent::Terminate);
+            }
             if let Err(err) = cancel_run_virtual_processor(self.partition_handle, self.id) {
                 error!("{err}");
             }
-            // Disconnect the control channel and wait for the vCPU loop to observe cancellation
-            // before deleting its WHP processor. This is required when a later vCPU fails the
-            // startup placement barrier and already-created processors unwind.
-            self.event_sender.take();
             if let Some(thread) = self.vcpu_thread.take() {
                 let _ = thread.join();
             }
@@ -1656,6 +2100,37 @@ fn map_gpa_range_with_flags(
     Ok(())
 }
 
+fn bitmap_to_ranges(
+    guest_addr: u64,
+    region_size: u64,
+    page_size: u64,
+    bitmap: &[u64],
+    ranges: &mut Vec<GuestMemoryRange>,
+) {
+    let page_count = region_size.div_ceil(page_size);
+    let mut run_start = None;
+
+    for page in 0..=page_count {
+        let dirty = page < page_count
+            && bitmap
+                .get((page / 64) as usize)
+                .is_some_and(|word| word & (1_u64 << (page % 64)) != 0);
+        match (run_start, dirty) {
+            (None, true) => run_start = Some(page),
+            (Some(start), false) => {
+                let start_offset = start * page_size;
+                let end_offset = (page * page_size).min(region_size);
+                ranges.push(
+                    GuestMemoryRange::new(guest_addr + start_offset, end_offset - start_offset)
+                        .expect("WHP dirty bitmap describes a registered memory region"),
+                );
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+}
+
 fn unmap_gpa_range(partition: WHV_PARTITION_HANDLE, guest_addr: u64, size: u64) -> Result<()> {
     let hresult = unsafe { WHvUnmapGpaRange(partition, guest_addr, size) };
     if hresult < 0 {
@@ -1699,17 +2174,396 @@ fn set_vcpu_registers(
     Ok(())
 }
 
+#[cfg(target_arch = "aarch64")]
+fn arm64_execution_registers(
+    partition_handle: WHV_PARTITION_HANDLE,
+) -> Result<(Vec<WHV_REGISTER_NAME>, bool)> {
+    // These values come from WinHvPlatformDefs.h. `windows-sys` currently omits the ARM64 names,
+    // so retain the numeric ABI names alongside the architecture-qualified artifact.
+    let mut names = (WHV_ARM64_REGISTER_X0..=WHV_ARM64_REGISTER_GENERAL_END).collect::<Vec<_>>();
+    names.extend(WHV_ARM64_REGISTER_Q0..=WHV_ARM64_REGISTER_Q31);
+    names.extend([WHV_ARM64_REGISTER_FPCR, WHV_ARM64_REGISTER_FPSR]);
+    names.push(WHV_ARM64_REGISTER_ACTIVITY);
+    names.extend([
+        0x0004_0003, // ACTLR_EL1
+        0x0004_0026,
+        0x0004_0027, // APIAKeyLo/Hi_EL1
+        0x0004_0028,
+        0x0004_0029, // APIBKeyLo/Hi_EL1
+        0x0004_002a,
+        0x0004_002b, // APDAKeyLo/Hi_EL1
+        0x0004_002c,
+        0x0004_002d, // APDBKeyLo/Hi_EL1
+        0x0004_002e,
+        0x0004_002f, // APGAKeyLo/Hi_EL1
+        0x0004_000d, // CONTEXTIDR_EL1
+        0x0004_0004, // CPACR_EL1
+        0x0004_0035, // CSSELR_EL1
+        0x0004_0015, // ELR_EL1
+        0x0004_0008, // ESR_EL1
+        0x0004_0009, // FAR_EL1
+        0x0004_000b, // MAIR_EL1
+        0x0004_000a, // PAR_EL1
+        0x0004_0002, // SCTLR_EL1
+        0x0004_0014, // SPSR_EL1
+        0x0004_0011, // TPIDR_EL0
+        0x0004_000e, // TPIDR_EL1
+        0x0004_0010, // TPIDRRO_EL0
+        0x0004_0005, // TTBR0_EL1
+        0x0004_0006, // TTBR1_EL1
+        0x0004_0007, // TCR_EL1
+        0x0004_000c, // VBAR_EL1
+        0x0005_8008, // CNTKCTL_EL1
+        0x0005_800e, // CNTV_CTL_EL0
+        0x0005_800f, // CNTV_CVAL_EL0
+        0x0005_8011, // CNTVCT_EL0
+        WHV_ARM64_REGISTER_GICR_BASE_GPA,
+    ]);
+
+    // The implemented breakpoint/watchpoint counts are encoded as count-minus-one. Do not query
+    // the unimplemented tail of each bank: WHP rejects the whole register batch if it contains one.
+    let debug_features =
+        get_partition_register_u64(partition_handle, WHV_ARM64_REGISTER_ID_AA64DFR0_EL1)?;
+    let breakpoint_count = ((debug_features >> 12) & 0xf) as i32 + 1;
+    let watchpoint_count = ((debug_features >> 20) & 0xf) as i32 + 1;
+    names.extend(0x0005_0000..0x0005_0000 + breakpoint_count); // DBGBCR<n>_EL1
+    names.extend(0x0005_0010..0x0005_0010 + watchpoint_count); // DBGWCR<n>_EL1
+    names.extend(0x0005_0020..0x0005_0020 + breakpoint_count); // DBGBVR<n>_EL1
+    names.extend(0x0005_0030..0x0005_0030 + watchpoint_count); // DBGWVR<n>_EL1
+    names.extend([
+        0x0005_0045, // DBGPRCR_EL1
+        0x0005_004d, // MDSCR_EL1
+        0x0005_004e, // OSDLR_EL1
+        0x0005_0052, // OSLAR_EL1
+    ]);
+
+    let processor_features =
+        get_partition_register_u64(partition_handle, WHV_ARM64_REGISTER_ID_AA64PFR0_EL1)?;
+    let sve_enabled = ((processor_features >> 32) & 0xf) != 0;
+    if sve_enabled {
+        names.push(0x0004_0071); // ZCR_EL1
+    }
+    Ok((names, sve_enabled))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn capture_whp_vcpu_state(_partition_handle: WHV_PARTITION_HANDLE, _id: u8) -> Result<Vec<u8>> {
+    // WHP's opaque ARM64 state APIs can deadlock when called re-entrantly on the vCPU worker.
+    // The controller completes the artifact after this owning-thread barrier acknowledges.
+    Ok(Vec::new())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn capture_whp_vcpu_state_on_controller(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u32,
+) -> Result<Vec<u8>> {
+    let id = u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".to_string()))?;
+    let (names, sve_enabled) = arm64_execution_registers(partition_handle)?;
+    let values = get_vcpu_register_bytes(partition_handle, id, &names)?;
+    let interrupt_controller = get_virtual_processor_state(
+        partition_handle,
+        u32::from(id),
+        WHV_ARM64_VP_STATE_INTERRUPT_CONTROLLER,
+    )?;
+    let optional_sve = if sve_enabled {
+        Some(get_virtual_processor_state(
+            partition_handle,
+            u32::from(id),
+            WHV_ARM64_VP_STATE_SVE,
+        )?)
+    } else {
+        None
+    };
+    let state = WhpVcpuExecutionState {
+        registers: names.into_iter().zip(values).collect(),
+        interrupt_controller,
+        optional_sve,
+    };
+    bincode::serde::encode_to_vec(&state, bincode::config::standard())
+        .map_err(|error| Error::StateCodec(error.to_string()))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn restore_whp_vcpu_state(
+    _partition_handle: WHV_PARTITION_HANDLE,
+    _id: u8,
+    bytes: &[u8],
+) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    Err(Error::StateCodec(
+        "WHP vCPU restore payload must be prepared by the controller".to_string(),
+    ))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn restore_whp_vcpu_state_on_controller(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u32,
+    bytes: &[u8],
+) -> Result<Arm64TimerState> {
+    let id = u8::try_from(id).map_err(|_| Error::StateCodec("vCPU id exceeds u8".to_string()))?;
+    let (state, consumed): (WhpVcpuExecutionState, usize) =
+        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .map_err(|error| Error::StateCodec(error.to_string()))?;
+    if consumed != bytes.len() {
+        return Err(Error::StateCodec("trailing vCPU state bytes".to_string()));
+    }
+    let (expected, sve_enabled) = arm64_execution_registers(partition_handle)?;
+    if state
+        .registers
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        != expected
+    {
+        return Err(Error::StateCodec(
+            "ARM64 register contract does not match this build".to_string(),
+        ));
+    }
+    if state.optional_sve.is_some() != sve_enabled {
+        return Err(Error::StateCodec(
+            "ARM64 SVE state does not match destination capabilities".to_string(),
+        ));
+    }
+    let timer_register = |name| {
+        let bytes = &state
+            .registers
+            .iter()
+            .find(|(id, _)| *id == name)
+            .expect("validated register contract")
+            .1;
+        u64::from_le_bytes(bytes[..8].try_into().expect("eight-byte register"))
+    };
+    let timer = Arm64TimerState {
+        id,
+        deadline: timer_register(WHV_ARM64_REGISTER_CNTV_CVAL),
+        control: timer_register(WHV_ARM64_REGISTER_CNTV_CTL) & 3,
+    };
+    // Keep counters frozen through construction. Timer compare/control must
+    // wait until partition time starts, otherwise WHP rebases their values.
+    let registers = state
+        .registers
+        .iter()
+        .filter(|(name, _)| {
+            *name != WHV_ARM64_REGISTER_CNTV_CVAL && *name != WHV_ARM64_REGISTER_CNTV_CTL
+        })
+        .collect::<Vec<_>>();
+    let names = registers.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    let values = registers
+        .iter()
+        .map(|(_, bytes)| register_value_from_bytes(bytes))
+        .collect::<Vec<_>>();
+    set_vcpu_registers(
+        partition_handle,
+        id,
+        &[WHV_ARM64_REGISTER_CNTV_CTL],
+        &[register_value_u64(0)],
+    )?;
+    set_vcpu_registers(partition_handle, id, &names, &values)?;
+    set_virtual_processor_state(
+        partition_handle,
+        u32::from(id),
+        WHV_ARM64_VP_STATE_INTERRUPT_CONTROLLER,
+        &state.interrupt_controller,
+    )?;
+    if let Some(sve) = state.optional_sve {
+        set_virtual_processor_state(
+            partition_handle,
+            u32::from(id),
+            WHV_ARM64_VP_STATE_SVE,
+            &sve,
+        )?;
+    }
+    Ok(timer)
+}
+
+fn set_partition_time_running(handle: WHV_PARTITION_HANDLE, running: bool) -> Result<()> {
+    // Caller owns the all-vCPU pause barrier; these calls never race a run.
+    let status = unsafe {
+        if running {
+            windows_sys::Win32::System::Hypervisor::WHvResumePartitionTime(handle)
+        } else {
+            windows_sys::Win32::System::Hypervisor::WHvSuspendPartitionTime(handle)
+        }
+    };
+    if status < 0 {
+        return Err(Error::StateCodec(format!(
+            "partition time running={running}: HRESULT {status:#x}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn capture_whp_vcpu_state(_partition_handle: WHV_PARTITION_HANDLE, _id: u8) -> Result<Vec<u8>> {
+    Ok(Vec::new()) // Controller captures after every worker acknowledges.
+}
+
+#[cfg(target_arch = "x86_64")]
+fn restore_whp_vcpu_state(
+    _partition_handle: WHV_PARTITION_HANDLE,
+    _id: u8,
+    bytes: &[u8],
+) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    Err(Error::StateCodec(
+        "WHP restore payload was not prepared by the controller".into(),
+    ))
+}
+
+fn get_vcpu_register_bytes(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u8,
+    names: &[WHV_REGISTER_NAME],
+) -> Result<Vec<[u8; 16]>> {
+    let mut values = vec![AlignedRegisterValue(WHV_REGISTER_VALUE::default()); names.len()];
+    let hresult = unsafe {
+        WHvGetVirtualProcessorRegisters(
+            partition_handle,
+            u32::from(id),
+            names.as_ptr(),
+            names.len() as u32,
+            values.as_mut_ptr().cast(),
+        )
+    };
+    if hresult < 0 {
+        return Err(Error::GetVirtualProcessorRegisters { id, hresult });
+    }
+    Ok(values
+        .iter()
+        .map(|value| unsafe {
+            let mut bytes = [0_u8; 16];
+            std::ptr::copy_nonoverlapping(
+                (&value.0 as *const WHV_REGISTER_VALUE).cast::<u8>(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+            );
+            bytes
+        })
+        .collect())
+}
+
+fn register_value_from_bytes(bytes: &[u8; 16]) -> WHV_REGISTER_VALUE {
+    let mut value = WHV_REGISTER_VALUE::default();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (&mut value as *mut WHV_REGISTER_VALUE).cast::<u8>(),
+            bytes.len(),
+        );
+    }
+    value
+}
+
+fn get_virtual_processor_state(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u32,
+    state_type: i32,
+) -> Result<Vec<u8>> {
+    // WHP documents a two-call contract for opaque state. The zero-sized query avoids guessing a
+    // category's ABI size and is required for ARM64 GIC state on current Windows builds.
+    let mut written = 0_u32;
+    let size_result = unsafe {
+        WHvGetVirtualProcessorState(
+            partition_handle,
+            id,
+            state_type,
+            std::ptr::null_mut(),
+            0,
+            &mut written,
+        )
+    };
+    let required = written as usize;
+    if required == 0 || required > MAX_WHP_OPAQUE_STATE_SIZE {
+        return Err(Error::GetVirtualProcessorState {
+            id,
+            state_type,
+            hresult: size_result,
+        });
+    }
+
+    let mut bytes = vec![0_u8; required];
+    let hresult = unsafe {
+        WHvGetVirtualProcessorState(
+            partition_handle,
+            id,
+            state_type,
+            bytes.as_mut_ptr().cast(),
+            bytes.len() as u32,
+            &mut written,
+        )
+    };
+    if hresult < 0 || written as usize > bytes.len() {
+        return Err(Error::GetVirtualProcessorState {
+            id,
+            state_type,
+            hresult,
+        });
+    }
+    bytes.truncate(written as usize);
+    Ok(bytes)
+}
+
+fn set_virtual_processor_state(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u32,
+    state_type: i32,
+    bytes: &[u8],
+) -> Result<()> {
+    let size = u32::try_from(bytes.len()).map_err(|_| Error::StateTooLarge)?;
+    let hresult = unsafe {
+        WHvSetVirtualProcessorState(
+            partition_handle,
+            id,
+            state_type,
+            bytes.as_ptr().cast(),
+            size,
+        )
+    };
+    if hresult < 0 {
+        return Err(Error::SetVirtualProcessorState {
+            id,
+            state_type,
+            hresult,
+        });
+    }
+    Ok(())
+}
+
 fn get_vcpu_register_u64(
     partition_handle: WHV_PARTITION_HANDLE,
     id: u8,
     name: WHV_REGISTER_NAME,
 ) -> Result<u64> {
+    get_register_u64(partition_handle, u32::from(id), name)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn get_partition_register_u64(
+    partition_handle: WHV_PARTITION_HANDLE,
+    name: WHV_REGISTER_NAME,
+) -> Result<u64> {
+    get_register_u64(partition_handle, WHV_ANY_VP, name)
+}
+
+fn get_register_u64(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u32,
+    name: WHV_REGISTER_NAME,
+) -> Result<u64> {
     let mut value = WHV_REGISTER_VALUE { Reg64: 0 };
-    let hresult = unsafe {
-        WHvGetVirtualProcessorRegisters(partition_handle, id.into(), &name, 1, &mut value)
-    };
+    let hresult =
+        unsafe { WHvGetVirtualProcessorRegisters(partition_handle, id, &name, 1, &mut value) };
     if hresult < 0 {
-        return Err(Error::GetVirtualProcessorRegisters { id, hresult });
+        return Err(Error::GetVirtualProcessorRegisters {
+            id: id.try_into().unwrap_or(u8::MAX),
+            hresult,
+        });
     }
 
     Ok(unsafe { value.Reg64 })
@@ -1815,7 +2669,7 @@ fn run_vcpu(
     event_receiver: Receiver<VcpuEvent>,
     response_sender: Sender<VcpuResponse>,
 ) {
-    if wait_until_resumed(&event_receiver, &response_sender).is_err() {
+    if wait_until_resumed(partition_handle, id, &event_receiver, &response_sender).is_err() {
         return;
     }
 
@@ -1824,8 +2678,8 @@ fn run_vcpu(
     #[cfg(target_arch = "x86_64")]
     if id != 0 {
         if let Some(router) = &sipi_router {
-            match router.wait_for_sipi(id, &event_receiver, &response_sender) {
-                Ok(vector) => {
+            match router.wait_for_sipi(id, partition_handle, &event_receiver, &response_sender) {
+                Ok(Some(vector)) => {
                     if let Err(err) = apply_sipi_startup_state(partition_handle, id, vector) {
                         error!("{err}");
                         signal_vcpu_exit(&response_sender, &exit_evt, 1);
@@ -1833,6 +2687,7 @@ fn run_vcpu(
                     }
                     spawn_ap_probe(partition_handle, id);
                 }
+                Ok(None) => {}
                 Err(()) => return,
             }
         }
@@ -1868,14 +2723,27 @@ fn run_vcpu(
     let mut exit_context = WHV_RUN_VP_EXIT_CONTEXT::default();
     loop {
         match event_receiver.try_recv() {
-            Ok(VcpuEvent::Pause) => {
-                let _ = response_sender.send(VcpuResponse::Paused);
-                if wait_until_resumed(&event_receiver, &response_sender).is_err() {
+            Ok(VcpuEvent::Terminate) => return,
+            Ok(VcpuEvent::Pause { request_id }) => {
+                let _ = response_sender.send(VcpuResponse::Paused { request_id });
+                if wait_until_resumed(partition_handle, id, &event_receiver, &response_sender)
+                    .is_err()
+                {
                     return;
                 }
             }
-            Ok(VcpuEvent::Resume) => {
-                let _ = response_sender.send(VcpuResponse::Resumed);
+            Ok(VcpuEvent::Resume { request_id }) => {
+                let _ = response_sender.send(VcpuResponse::Resumed { request_id });
+            }
+            Ok(VcpuEvent::CaptureState { request_id }) => {
+                let result =
+                    capture_whp_vcpu_state(partition_handle, id).map_err(|error| error.to_string());
+                let _ = response_sender.send(VcpuResponse::StateCaptured { request_id, result });
+            }
+            Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
+                let result = restore_whp_vcpu_state(partition_handle, id, &bytes)
+                    .map_err(|error| error.to_string());
+                let _ = response_sender.send(VcpuResponse::StateRestored { request_id, result });
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => return,
@@ -2161,9 +3029,8 @@ fn normalize_cpuid(id: u8, vcpu_count: u8, access: &WHV_X64_CPUID_ACCESS_CONTEXT
     result
 }
 
-/// Host processor clock (TSC) frequency, queried once. `None` when the
+/// Host processor clock (TSC/ARM counter) frequency, queried once. `None` when the
 /// platform cannot report it; the guest then calibrates as before.
-#[cfg(target_arch = "x86_64")]
 fn host_tsc_frequency_hz() -> Option<u64> {
     static TSC_HZ: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *TSC_HZ.get_or_init(|| {
@@ -2171,7 +3038,7 @@ fn host_tsc_frequency_hz() -> Option<u64> {
         let mut written_size = 0;
         let hresult = unsafe {
             WHvGetCapability(
-                WHvCapabilityCodeProcessorClockFrequency,
+                windows_sys::Win32::System::Hypervisor::WHvCapabilityCodeProcessorClockFrequency,
                 &mut capability as *mut WHV_CAPABILITY as *mut _,
                 size_of::<WHV_CAPABILITY>() as u32,
                 &mut written_size,
@@ -2489,17 +3356,30 @@ fn arm64_general_register(index: u8) -> WHV_REGISTER_NAME {
 }
 
 fn wait_until_resumed(
+    partition_handle: WHV_PARTITION_HANDLE,
+    id: u8,
     event_receiver: &Receiver<VcpuEvent>,
     response_sender: &Sender<VcpuResponse>,
 ) -> result::Result<(), ()> {
     loop {
         match event_receiver.recv() {
-            Ok(VcpuEvent::Resume) => {
-                let _ = response_sender.send(VcpuResponse::Resumed);
+            Ok(VcpuEvent::Terminate) => return Err(()),
+            Ok(VcpuEvent::Resume { request_id }) => {
+                let _ = response_sender.send(VcpuResponse::Resumed { request_id });
                 return Ok(());
             }
-            Ok(VcpuEvent::Pause) => {
-                let _ = response_sender.send(VcpuResponse::Paused);
+            Ok(VcpuEvent::Pause { request_id }) => {
+                let _ = response_sender.send(VcpuResponse::Paused { request_id });
+            }
+            Ok(VcpuEvent::CaptureState { request_id }) => {
+                let result =
+                    capture_whp_vcpu_state(partition_handle, id).map_err(|error| error.to_string());
+                let _ = response_sender.send(VcpuResponse::StateCaptured { request_id, result });
+            }
+            Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
+                let result = restore_whp_vcpu_state(partition_handle, id, &bytes)
+                    .map_err(|error| error.to_string());
+                let _ = response_sender.send(VcpuResponse::StateRestored { request_id, result });
             }
             Err(_) => return Err(()),
         }
@@ -2737,6 +3617,31 @@ unsafe extern "system" fn emulator_translate_gva_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restored_running_ap_skips_sipi_register_reset() {
+        let router = ApStartupRouter::new(2);
+        *router.slots[1].lock().unwrap() = ApParkState::Running;
+        let (_events, receiver) = unbounded();
+        let (responses, _receiver) = unbounded();
+        // No WHP call occurs: the existing captured PC must survive startup.
+        assert_eq!(router.wait_for_sipi(1, 0, &receiver, &responses), Ok(None));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pending_sipi_keeps_its_vector() {
+        let router = ApStartupRouter::new(2);
+        *router.slots[1].lock().unwrap() = ApParkState::SipiPending(0x42);
+        let (_events, receiver) = unbounded();
+        let (responses, _receiver) = unbounded();
+        assert_eq!(
+            router.wait_for_sipi(1, 0, &receiver, &responses),
+            Ok(Some(0x42))
+        );
+        assert!(*router.slots[1].lock().unwrap() == ApParkState::Running);
+    }
 
     #[test]
     fn group_affinity_encodes_processor_group_and_single_cpu_mask() {
