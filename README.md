@@ -130,7 +130,10 @@ checks pathname ownership before reactivation. Poll registration and worker
 startup must succeed before activation is announced. Active streams reset on
 quiescence; queued host connections can wait for reactivation of the same device.
 Dropping an active device joins its workers and removes only its owned pathname,
-not a replacement endpoint. Path identity checks are lifecycle safeguards, not
+not a replacement endpoint. The existing VMM exit-observer path also retires
+vsock before normal process exit, which bypasses Rust destructors. Forced process
+termination can still leave a pathname; a new launch must use its own fresh path.
+Path identity checks are lifecycle safeguards, not
 protection against an attacker with write access to the parent directory.
 
 Successful binding is not proof that a guest service is listening, authenticated

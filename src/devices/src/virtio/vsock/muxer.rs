@@ -160,6 +160,7 @@ pub struct VsockMuxer {
     stop_evt: EventFd,
     muxer_thread: Option<JoinHandle<()>>,
     reaper_thread: Option<JoinHandle<()>>,
+    retired: bool,
     #[cfg(target_os = "macos")]
     timesync_stop: Arc<(Mutex<bool>, Condvar)>,
     #[cfg(target_os = "macos")]
@@ -211,6 +212,7 @@ impl VsockMuxer {
             stop_evt: EventFd::new(EFD_NONBLOCK).map_err(VsockError::EventFd)?,
             muxer_thread: None,
             reaper_thread: None,
+            retired: false,
             #[cfg(target_os = "macos")]
             timesync_stop: Arc::new((Mutex::new(false), Condvar::new())),
             #[cfg(target_os = "macos")]
@@ -224,6 +226,12 @@ impl VsockMuxer {
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
     ) -> std::io::Result<()> {
+        if self.retired {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "vsock device has exited",
+            ));
+        }
         if self.muxer_thread.is_some() || self.reaper_thread.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -354,6 +362,14 @@ impl VsockMuxer {
         self.queue = None;
         self.mem = None;
         self.interrupt = None;
+        result
+    }
+
+    /// Release transport endpoints before the VMM's process-level exit.
+    pub(crate) fn retire(&mut self) -> std::io::Result<()> {
+        self.retired = true;
+        let result = self.quiesce();
+        self.host_listeners.clear();
         result
     }
 

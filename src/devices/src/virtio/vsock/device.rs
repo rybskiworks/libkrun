@@ -15,7 +15,7 @@ use vm_memory::GuestMemoryMmap;
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
-    VirtioDevice, VirtioStateError,
+    VirtioDevice, VirtioStateError, VmmExitObserver,
 };
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
@@ -371,6 +371,19 @@ impl VirtioDevice for Vsock {
     }
 }
 
+impl VmmExitObserver for Vsock {
+    fn on_vmm_exit(&mut self, _exit_code: i32) {
+        // Normal VMM shutdown uses _exit(), so destructors alone do not run.
+        #[cfg(unix)]
+        let result = self.muxer.retire();
+        #[cfg(windows)]
+        let result = self.muxer.quiesce();
+        if let Err(error) = result {
+            error!("failed to stop vsock transport on VMM exit: {error}");
+        }
+    }
+}
+
 fn take_shared_queue(
     queue: Arc<Mutex<VirtQueue>>,
     error: &'static str,
@@ -432,6 +445,40 @@ mod tests {
         assert!(vsock.queue_rx.is_none());
         assert!(vsock.queue_tx.is_none());
         assert!(vsock.queue_ev.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exit_observer_releases_listener_before_process_exit() {
+        let dir = utils::tempdir::TempDir::new().unwrap();
+        let path = dir.as_path().join("host.sock");
+        for active in [false, true] {
+            let mut vsock = Vsock::new(
+                3,
+                None,
+                Some(HashMap::from([(5000, (path.clone(), true))])),
+                None,
+                None,
+                TsiFlags::empty(),
+            )
+            .unwrap();
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+            let interrupt =
+                InterruptTransport::new(DummyIrqChip::new().into(), "test-vsock".into()).unwrap();
+            if active {
+                vsock
+                    .activate(mem.clone(), interrupt.clone(), queues())
+                    .unwrap();
+            }
+            assert!(path.exists());
+            vsock.on_vmm_exit(0);
+            assert!(!path.exists());
+            vsock.on_vmm_exit(0);
+            assert!(vsock
+                .muxer
+                .activate(mem, Arc::new(Mutex::new(Queue::new(256))), interrupt)
+                .is_err());
+        }
     }
 
     #[test]
