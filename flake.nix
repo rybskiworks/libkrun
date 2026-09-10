@@ -196,6 +196,8 @@
                 done
                 cargo test --locked --offline -p msb_krun_devices --lib --features blk,net virtio::vmgenid::
                 cargo test --locked --offline -p msb_krun_devices --lib --features blk,net virtio::block::backend::tests::
+                cargo test --locked --offline -p msb_krun_devices --lib --features blk,net virtio::vsock::
+                cargo test --locked --offline -p msb_krun_utils --lib epoll::tests::
                 runHook postBuild
               '';
               installPhase = ''

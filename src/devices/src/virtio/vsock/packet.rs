@@ -12,9 +12,9 @@
 /// the header, and an optional second descriptor holds the data. The second descriptor is only
 /// present for data packets (VSOCK_OP_RW).
 ///
-/// `VsockPacket` wraps these two buffers and provides direct access to the data stored
-/// in guest memory. This is done to avoid unnecessarily copying data from guest memory
-/// to temporary buffers, before passing it on to the vsock backend.
+/// TX headers are snapshotted before validation so guest writes cannot change
+/// routing or lengths between checks. RX headers and payload buffers retain
+/// direct guest-memory access to avoid copying packet data.
 use std::convert::TryInto;
 use std::ffi::CStr;
 #[cfg(unix)]
@@ -29,7 +29,7 @@ use nix::sys::socket::{sockaddr, AddressFamily};
 #[cfg(unix)]
 use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use utils::byte_order;
-use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryError};
+use vm_memory::{self, Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError};
 
 use super::super::DescriptorChain;
 use super::defs;
@@ -202,9 +202,14 @@ pub struct TsiReleaseReq {
 /// - the chain head, holding the packet header; and
 /// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
 pub struct VsockPacket {
-    hdr: *mut u8,
+    hdr: PacketHeader,
     buf: Option<*mut u8>,
     buf_size: usize,
+}
+
+enum PacketHeader {
+    Tx([u8; VSOCK_PKT_HDR_SIZE]),
+    Rx(*mut u8),
 }
 
 fn get_host_address<T: GuestMemory + vm_memory::GuestMemoryBackend>(
@@ -233,9 +238,12 @@ impl VsockPacket {
             return Err(VsockError::HdrDescTooSmall(head.len));
         }
 
+        let mut header = [0; VSOCK_PKT_HDR_SIZE];
+        head.mem
+            .read_slice(&mut header, head.addr)
+            .map_err(VsockError::GuestMemoryMmap)?;
         let mut pkt = Self {
-            hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
-                .map_err(VsockError::GuestMemoryMmap)?,
+            hdr: PacketHeader::Tx(header),
             buf: None,
             buf_size: 0,
         };
@@ -291,8 +299,10 @@ impl VsockPacket {
         }
 
         let mut pkt = Self {
-            hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
-                .map_err(VsockError::GuestMemoryMmap)?,
+            hdr: PacketHeader::Rx(
+                get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
+                    .map_err(VsockError::GuestMemoryMmap)?,
+            ),
             buf: None,
             buf_size: 0,
         };
@@ -323,18 +333,26 @@ impl VsockPacket {
         Ok(pkt)
     }
 
-    /// Provides in-place, byte-slice, access to the vsock packet header.
+    /// Read the TX snapshot or the in-place RX header.
     pub fn hdr(&self) -> &[u8] {
-        // This is safe since bound checks have already been performed when creating the packet
-        // from the virtq descriptor.
-        unsafe { std::slice::from_raw_parts(self.hdr as *const u8, VSOCK_PKT_HDR_SIZE) }
+        match &self.hdr {
+            PacketHeader::Tx(header) => header,
+            // Bounds were checked when creating the packet from the descriptor.
+            PacketHeader::Rx(ptr) => unsafe {
+                std::slice::from_raw_parts(*ptr as *const u8, VSOCK_PKT_HDR_SIZE)
+            },
+        }
     }
 
-    /// Provides in-place, byte-slice, mutable access to the vsock packet header.
+    /// Modify the TX snapshot or write directly to the guest's RX header.
     pub fn hdr_mut(&mut self) -> &mut [u8] {
-        // This is safe since bound checks have already been performed when creating the packet
-        // from the virtq descriptor.
-        unsafe { std::slice::from_raw_parts_mut(self.hdr, VSOCK_PKT_HDR_SIZE) }
+        match &mut self.hdr {
+            PacketHeader::Tx(header) => header,
+            // Bounds were checked when creating the packet from the descriptor.
+            PacketHeader::Rx(ptr) => unsafe {
+                std::slice::from_raw_parts_mut(*ptr, VSOCK_PKT_HDR_SIZE)
+            },
+        }
     }
 
     /// Provides in-place, byte-slice access to the vsock packet data buffer.
@@ -739,5 +757,58 @@ impl VsockPacket {
                 byte_order::write_le_u64(&mut buf[0..], time);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::Descriptor;
+    use vm_memory::GuestMemoryMmap;
+
+    const TABLE: GuestAddress = GuestAddress(0x1000);
+    const HEADER: GuestAddress = GuestAddress(0x2000);
+
+    fn descriptor(mem: &GuestMemoryMmap, writable: bool) -> DescriptorChain<'_> {
+        mem.write_obj(
+            Descriptor {
+                addr: HEADER.0,
+                len: VSOCK_PKT_HDR_SIZE as u32 + 8,
+                flags: if writable { 2 } else { 0 },
+                next: 0,
+            },
+            TABLE,
+        )
+        .unwrap();
+        DescriptorChain::checked_new(mem, TABLE, 1, 0).unwrap()
+    }
+
+    #[test]
+    fn tx_header_is_stable_after_guest_memory_changes() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let head = descriptor(&mem, false);
+        let pkt = VsockPacket::from_tx_virtq_head(&head).unwrap();
+
+        mem.write_slice(&[0xff; VSOCK_PKT_HDR_SIZE], HEADER)
+            .unwrap();
+
+        assert_eq!(pkt.hdr(), &[0; VSOCK_PKT_HDR_SIZE]);
+        assert_eq!(pkt.len(), 0);
+        assert_eq!(pkt.payload(), Some(&[][..]));
+    }
+
+    #[test]
+    fn rx_header_still_writes_into_guest_memory() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let head = descriptor(&mem, true);
+        let mut pkt = VsockPacket::from_rx_virtq_head(&head).unwrap();
+
+        pkt.set_src_cid(2).set_dst_cid(42).set_dst_port(5000);
+
+        let mut written = [0; VSOCK_PKT_HDR_SIZE];
+        mem.read_slice(&mut written, HEADER).unwrap();
+        assert_eq!(written.as_slice(), pkt.hdr());
+        assert_eq!(byte_order::read_le_u64(&written[HDROFF_DST_CID..]), 42);
+        assert_eq!(byte_order::read_le_u32(&written[HDROFF_DST_PORT..]), 5000);
     }
 }

@@ -103,6 +103,19 @@ In addition, when using virtio-fs, a guest may exhaust filesystem resources such
 
 When TSI is enabled, the VMM acts as a proxy for AF_INET, AF_INET6 and AF_UNIX sockets, for both incoming and outgoing connections. For all that matters, the VMM and the guest should be considered to be running in the network context. As such, you should apply on the VMM whatever restrictions you want to apply on the guest.
 
+### Custom vsock peer identity
+
+Custom stream and datagram backends receive the VMM-configured guest CID in
+their connection metadata. Packets claiming a different source CID are dropped
+before backend dispatch. Transmit headers are copied once before validation;
+subsequent guest-memory writes cannot change the selected ports or operation.
+Payloads remain guest-controlled and are not authenticated by this check.
+
+The default CID allocator is process-local. A supervisor spanning multiple VMM
+processes must reserve distinct CIDs, pass them through the existing guest-CID
+override, and bind them to its own workload lifecycle. A CID is transport
+attribution, not an application username, credential grant or launch generation.
+
 ## Building and installing
 
 ### Nix (x86_64 Linux)
@@ -116,12 +129,16 @@ public headers and `libkrun.pc` alongside the library.
 ```sh
 nix build .#libkrun
 nix build .#checks.x86_64-linux.unit-msb-krun .#checks.x86_64-linux.c-sdk
+nix build .#checks.x86_64-linux.unit-state .#checks.x86_64-linux.fmt
 ```
 
 The unit check rebuilds the guest init executable and tests the Rust API with both
 the default and `net` features. The C SDK check compiles and runs a context
 creation/destruction consumer against the installed headers and library. Neither
 check boots a VM; C API VM launches also need `libkrunfw.so.5` on the loader path.
+
+The state check also covers vsock source validation, stable transmit headers,
+poller ownership and repeated device quiescence/reactivation without KVM.
 
 The development shell uses the shared `nix-tooling` devenv modules. Pure shell
 evaluation needs a file containing the writable checkout path:

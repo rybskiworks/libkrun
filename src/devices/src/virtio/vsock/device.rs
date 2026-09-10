@@ -399,19 +399,31 @@ mod tests {
 
     #[test]
     fn vsock_quiesce_joins_background_workers_and_is_reactivatable() {
+        let (completed, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            check_repeated_quiescence();
+            completed.send(()).unwrap();
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("vsock workers must stop promptly on every activation");
+        worker.join().unwrap();
+    }
+
+    fn check_repeated_quiescence() {
         let mut vsock = Vsock::new(3, None, None, None, None, TsiFlags::empty()).unwrap();
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
         let interrupt =
             InterruptTransport::new(DummyIrqChip::new().into(), "test-vsock".into()).unwrap();
 
-        vsock
-            .activate(mem.clone(), interrupt.clone(), queues())
-            .unwrap();
-        let queues = vsock.quiesce().unwrap();
-        assert_eq!(queues.len(), defs::NUM_QUEUES);
-        assert!(!vsock.is_activated());
-
-        vsock.activate(mem, interrupt, queues).unwrap();
-        assert_eq!(vsock.quiesce().unwrap().len(), defs::NUM_QUEUES);
+        let mut queues = queues();
+        for _ in 0..8 {
+            vsock
+                .activate(mem.clone(), interrupt.clone(), queues)
+                .unwrap();
+            queues = vsock.quiesce().unwrap();
+            assert_eq!(queues.len(), defs::NUM_QUEUES);
+            assert!(!vsock.is_activated());
+        }
     }
 }

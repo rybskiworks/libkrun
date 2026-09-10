@@ -322,7 +322,7 @@ impl VsockMuxer {
             }
         };
         let request = VsockConnectRequest {
-            guest_cid: pkt.src_cid(),
+            guest_cid: self.cid,
             guest_port: pkt.src_port(),
             host_port: pkt.dst_port(),
         };
@@ -405,7 +405,7 @@ impl VsockMuxer {
     }
 
     pub(crate) fn send_stream_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
-        if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
+        if pkt.src_cid() != self.cid || pkt.dst_cid() != uapi::VSOCK_HOST_CID {
             return Ok(());
         }
         let Some(id) = stream_proxy_id(pkt.src_port(), pkt.dst_port()) else {
