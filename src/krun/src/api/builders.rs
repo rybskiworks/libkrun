@@ -823,6 +823,12 @@ impl VsockBuilder {
     }
 
     /// Listen on a host Unix socket and inject accepted streams into guest `port`.
+    ///
+    /// Device construction binds the socket or fails; an existing path is never
+    /// unlinked to make the bind succeed. Use a fresh per-launch path in a
+    /// supervisor-owned private directory. The device retains the listener over
+    /// quiescence/reactivation and removes its own pathname on destruction.
+    /// Binding establishes host transport availability, not guest-service readiness.
     #[cfg(not(target_os = "windows"))]
     pub fn unix_listen(mut self, port: u32, path: impl AsRef<Path>) -> Self {
         self.routes.push(VsockRoute::UnixListen {

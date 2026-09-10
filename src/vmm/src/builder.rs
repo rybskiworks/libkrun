@@ -4710,6 +4710,9 @@ fn attach_vsock_device(
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc, vsock.clone()).map_err(RegisterVsockDevice)?;
 
+    // The process exit path bypasses destructors, just as for console teardown.
+    vmm.exit_observers.push(vsock.clone());
+
     Ok(())
 }
 

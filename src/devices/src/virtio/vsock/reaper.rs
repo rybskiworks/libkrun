@@ -69,10 +69,14 @@ impl ReaperThread {
         }
     }
 
-    pub fn run(mut self) -> thread::JoinHandle<()> {
+    #[cfg(windows)]
+    pub fn run(self) -> thread::JoinHandle<()> {
+        self.try_run().expect("failed to start vsock reaper")
+    }
+
+    pub fn try_run(mut self) -> std::io::Result<thread::JoinHandle<()>> {
         thread::Builder::new()
             .name("vsock reaper".into())
             .spawn(move || self.work())
-            .unwrap()
     }
 }

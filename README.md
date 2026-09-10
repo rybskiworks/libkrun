@@ -116,6 +116,32 @@ processes must reserve distinct CIDs, pass them through the existing guest-CID
 override, and bind them to its own workload lifecycle. A CID is transport
 attribution, not an application username, credential grant or launch generation.
 
+### Host-listen vsock lifecycle
+
+The existing Rust `VsockBuilder::unix_listen(port, path)` direction accepts host
+Unix streams and injects them into the configured guest port. Device construction
+binds every configured listener synchronously; a collision or unusable path fails
+construction instead of silently disabling a route. Failed construction releases
+listeners already created, without removing pre-existing paths.
+
+Use a fresh per-launch pathname in a private supervisor-owned directory. The
+device owns the socket until destruction, retains it across quiescence, and
+checks pathname ownership before reactivation. Poll registration and worker
+startup must succeed before activation is announced. Active streams reset on
+quiescence; queued host connections can wait for reactivation of the same device.
+Dropping an active device joins its workers and removes only its owned pathname,
+not a replacement endpoint. The existing VMM exit-observer path also retires
+vsock before normal process exit, which bypasses Rust destructors. Forced process
+termination can still leave a pathname; a new launch must use its own fresh path.
+Path identity checks are lifecycle safeguards, not
+protection against an attacker with write access to the parent directory.
+
+Successful binding is not proof that a guest service is listening, authenticated
+or ready. Supervisors must establish their application-level readiness contract
+over the stream before admitting dependent work. Host-originated connections use
+the ordinary vsock host CID; original workload attribution and application policy
+belong above this transport and are not inferred from a guest-provided payload.
+
 ## Building and installing
 
 ### Nix (x86_64 Linux)
@@ -138,7 +164,8 @@ creation/destruction consumer against the installed headers and library. Neither
 check boots a VM; C API VM launches also need `libkrunfw.so.5` on the loader path.
 
 The state check also covers vsock source validation, stable transmit headers,
-poller ownership and repeated device quiescence/reactivation without KVM.
+poller ownership, host-listener bind/rollback/path ownership, guest attempts to
+release listeners, and repeated device quiescence/reactivation without KVM.
 
 The development shell uses the shared `nix-tooling` devenv modules. Pure shell
 evaluation needs a file containing the writable checkout path:
