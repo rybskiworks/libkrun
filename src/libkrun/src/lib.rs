@@ -1994,7 +1994,7 @@ pub unsafe extern "C" fn krun_get_guest_cid(ctx_id: u32, out_cid: *mut u32) -> i
 
 /// Pins the guest vsock CID for a context. Must be called before `krun_start_enter`.
 ///
-/// The CID must not be 0, 1 or 2 (reserved; 2 addresses the host) and must
+/// The CID must not be 0, 1, 2 or `u32::MAX` (reserved/wildcard) and must
 /// not already be assigned to another VM in this process: collisions fail
 /// with an error instead of being silently reused. On success the context's
 /// `krun_create_ctx` allocation is superseded (it stays reserved, never

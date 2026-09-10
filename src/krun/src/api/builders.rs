@@ -875,7 +875,7 @@ impl VsockBuilder {
 
     /// Pin the guest vsock Context Identifier (CID) for the VM.
     ///
-    /// The CID must not be 0, 1 or 2 (reserved; 2 addresses the host) and
+    /// The CID must not be 0, 1, 2 or `u32::MAX` (reserved/wildcard) and
     /// must not already be assigned to another VM in this process — a
     /// duplicate fails [`VmBuilder::build`](crate::VmBuilder::build) with a
     /// vsock configuration error instead of being silently reused.

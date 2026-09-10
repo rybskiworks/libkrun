@@ -191,7 +191,7 @@
                 export CARGO_PROFILE_TEST_DEBUG=0
                 mkdir -p "$CARGO_HOME"
                 make init/init INIT_LDFLAGS="${initLdflags}"
-                for scope in memory_state private_memory device_state execution_state; do
+                for scope in memory_state private_memory device_state execution_state vmm_config::vsock; do
                   cargo test --locked --offline -p msb_krun_vmm --lib --features blk,net,devices/net "$scope::tests::"
                 done
                 cargo test --locked --offline -p msb_krun_devices --lib --features blk,net virtio::vmgenid::

@@ -1447,16 +1447,17 @@ mod tests {
 
     #[test]
     fn build_rejects_reserved_guest_cid_override() {
-        let err = VmBuilder::new()
-            .vsock(|vsock| vsock.guest_cid(2))
-            .build()
-            .err()
-            .expect("host CID pin must fail");
-
-        assert!(
-            matches!(err, Error::Config(ConfigError::Vsock(_))),
-            "pinning the host CID must surface as a vsock config error, got: {err:?}"
-        );
+        for cid in [0, 1, 2, u32::MAX] {
+            let err = VmBuilder::new()
+                .vsock(|vsock| vsock.guest_cid(cid))
+                .build()
+                .err()
+                .expect("reserved CID pin must fail");
+            assert!(
+                matches!(err, Error::Config(ConfigError::Vsock(_))),
+                "pinning reserved CID {cid} must surface as a vsock config error, got: {err:?}"
+            );
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
