@@ -278,6 +278,8 @@ impl VsockBuilder {
 pub(crate) mod tests {
     use std::io;
 
+    use proptest::prelude::*;
+
     use devices::virtio::vsock::{
         VsockDatagramBackend, VsockDatagramPeer, VsockDatagramPortBackend, VsockNotifier,
     };
@@ -427,6 +429,46 @@ pub(crate) mod tests {
             Err(VsockConfigError::GuestCidExhausted)
         ));
         assert_eq!(*used.lock().unwrap(), HashSet::from([u32::MAX - 1]));
+    }
+
+    proptest! {
+        #[test]
+        fn allocation_matches_ordered_available_ids(
+            start in prop_oneof![0u32..64, (u32::MAX - 64)..=u32::MAX, any::<u32>()],
+            offsets in proptest::collection::vec(0u8..64, 0..32),
+            attempts in 1usize..33,
+        ) {
+            let reserved: HashSet<u32> = offsets.into_iter()
+                .map(|offset| start.saturating_add(u32::from(offset)))
+                .filter(|cid| (3..u32::MAX).contains(cid))
+                .collect();
+            // The oracle enumerates a finite mathematical set using a wider
+            // integer, independently of the production atomic/CAS loop.
+            let expected: Vec<u32> = if (3..u32::MAX).contains(&start) {
+                (u64::from(start)..u64::from(u32::MAX))
+                    .take(96)
+                    .map(|cid| cid as u32)
+                    .filter(|cid| !reserved.contains(cid))
+                    .take(attempts)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let next = AtomicU32::new(start);
+            let used = Mutex::new(reserved.clone());
+            let mut actual = Vec::new();
+            for _ in 0..attempts {
+                match allocate_guest_cid_from(&next, &used) {
+                    Ok(cid) => actual.push(cid),
+                    Err(VsockConfigError::GuestCidExhausted) => {},
+                    Err(other) => prop_assert!(false, "unexpected allocation error: {other}"),
+                }
+            }
+            prop_assert_eq!(&actual, &expected);
+            let expected_used: HashSet<_> = reserved.into_iter().chain(expected).collect();
+            prop_assert_eq!(&*used.lock().unwrap(), &expected_used);
+            prop_assert!(next.load(Ordering::Relaxed) >= start);
+        }
     }
 
     #[test]

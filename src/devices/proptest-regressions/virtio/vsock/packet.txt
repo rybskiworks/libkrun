@@ -1,0 +1,2 @@
+# A one-byte declared payload must not decode a command from descriptor padding.
+cc 857575a29c9fd9fb91d171bbf592f42f945e475a0b7c1792788368bed08e967a
