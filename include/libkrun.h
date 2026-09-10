@@ -976,7 +976,7 @@ int32_t krun_get_guest_cid(uint32_t ctx_id, uint32_t *out_cid);
 /**
  * Pins the guest vsock CID for a context. Must be called before "krun_start_enter".
  *
- * The CID must not be 0, 1 or 2 (reserved; 2 addresses the host) and must
+ * The CID must not be 0, 1, 2 or UINT32_MAX (reserved/wildcard) and must
  * not already be assigned to another VM in this process: collisions fail
  * with an error instead of being silently reused.
  *

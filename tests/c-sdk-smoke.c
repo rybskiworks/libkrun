@@ -28,9 +28,15 @@ int main(void)
     CHECK(krun_set_guest_cid(first, pinned_cid) == 0);
     CHECK(krun_get_guest_cid(first, &first_cid) == 0);
     CHECK(first_cid == pinned_cid);
+    CHECK(krun_set_guest_cid(first, UINT32_MAX) == -EINVAL);
+    CHECK(krun_get_guest_cid(first, &first_cid) == 0);
+    CHECK(first_cid == pinned_cid);
     CHECK(krun_set_guest_cid(second, pinned_cid) == -EEXIST);
     CHECK(krun_get_guest_cid(second, &second_cid) == 0);
     CHECK(second_cid != first_cid);
+    CHECK(krun_set_guest_cid(second, UINT32_MAX - 1) == 0);
+    CHECK(krun_get_guest_cid(second, &second_cid) == 0);
+    CHECK(second_cid == UINT32_MAX - 1);
     CHECK(krun_free_ctx(first) == 0);
     CHECK(krun_get_guest_cid(first, &first_cid) == -ENOENT);
     CHECK(krun_free_ctx(second) == 0);
