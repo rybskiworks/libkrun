@@ -89,10 +89,9 @@ impl TimesyncThread {
         }
     }
 
-    pub fn run(mut self) -> thread::JoinHandle<()> {
+    pub fn run(mut self) -> std::io::Result<thread::JoinHandle<()>> {
         thread::Builder::new()
             .name("vsock timesync".into())
             .spawn(move || self.work())
-            .unwrap()
     }
 }

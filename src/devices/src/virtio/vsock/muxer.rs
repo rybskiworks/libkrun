@@ -14,7 +14,7 @@ use super::defs;
 use super::defs::uapi;
 use super::dgram::DatagramProxy;
 use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
-use super::muxer_thread::MuxerThread;
+use super::muxer_thread::{MuxerThread, STOP_EVENT};
 use super::packet::{TsiGetnameRsp, VsockPacket};
 use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
@@ -22,7 +22,7 @@ use super::reaper::ReaperThread;
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
 use super::tsi_stream::TsiStreamProxy;
-use super::unix::UnixProxy;
+use super::unix::{BoundUnixListener, UnixAcceptorProxy, UnixProxy};
 use super::VsockError;
 use super::{
     TsiFlags, VsockConnectRequest, VsockDatagramPeer, VsockDatagramPortBackend, VsockNotifier,
@@ -150,6 +150,7 @@ pub struct VsockMuxer {
     proxy_map: ProxyMap,
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
+    host_listeners: HashMap<u32, Arc<BoundUnixListener>>,
     custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
     custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
     dgram_peer_map: Mutex<HashMap<(u32, u32), DgramPeerEntry>>,
@@ -173,18 +174,31 @@ impl VsockMuxer {
         custom_port_map: Option<HashMap<u32, Arc<dyn VsockPortBackend>>>,
         custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
         tsi_flags: TsiFlags,
-    ) -> Self {
-        VsockMuxer {
+    ) -> super::Result<Self> {
+        let mut host_listeners = HashMap::new();
+        for (port, (path, listen)) in unix_ipc_port_map.iter().flatten() {
+            if *listen {
+                let listener =
+                    BoundUnixListener::bind(path).map_err(|error| VsockError::HostListener {
+                        port: *port,
+                        path: path.clone(),
+                        error,
+                    })?;
+                host_listeners.insert(*port, Arc::new(listener));
+            }
+        }
+        Ok(VsockMuxer {
             cid,
             host_port_map,
             queue: None,
             mem: None,
             rxq: Arc::new(Mutex::new(MuxerRxQ::new())),
-            epoll: Epoll::new().unwrap(),
+            epoll: Epoll::new().map_err(VsockError::Transport)?,
             interrupt: None,
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
             reaper_sender: None,
             unix_ipc_port_map,
+            host_listeners,
             custom_port_map,
             custom_dgram_port_map,
             dgram_peer_map: Mutex::new(HashMap::new()),
@@ -194,14 +208,14 @@ impl VsockMuxer {
             next_dgram_proxy_id: AtomicU64::new(1),
             next_dgram_activity: AtomicU64::new(1),
             tsi_flags,
-            stop_evt: EventFd::new(EFD_NONBLOCK).expect("failed to create vsock stop event"),
+            stop_evt: EventFd::new(EFD_NONBLOCK).map_err(VsockError::EventFd)?,
             muxer_thread: None,
             reaper_thread: None,
             #[cfg(target_os = "macos")]
             timesync_stop: Arc::new((Mutex::new(false), Condvar::new())),
             #[cfg(target_os = "macos")]
             timesync_thread: None,
-        }
+        })
     }
 
     pub(crate) fn activate(
@@ -209,7 +223,47 @@ impl VsockMuxer {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
-    ) {
+    ) -> std::io::Result<()> {
+        if self.muxer_thread.is_some() || self.reaper_thread.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "vsock muxer is already activated",
+            ));
+        }
+        let result = self.activate_inner(mem, queue, interrupt);
+        if result.is_err() {
+            // Partial activation must not leave a worker or poll registration behind.
+            self.quiesce()?;
+        }
+        result
+    }
+
+    fn activate_inner(
+        &mut self,
+        mem: GuestMemoryMmap,
+        queue: Arc<Mutex<VirtQueue>>,
+        interrupt: InterruptTransport,
+    ) -> std::io::Result<()> {
+        let stop_evt = self.stop_evt.try_clone()?;
+        self.epoll.ctl(
+            ControlOperation::Add,
+            self.stop_evt.as_raw_fd(),
+            &EpollEvent::new(EventSet::IN, STOP_EVENT),
+        )?;
+        for (port, listener) in &self.host_listeners {
+            listener.check_path()?;
+            let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            let proxy = UnixAcceptorProxy::new(id, listener.clone(), *port);
+            self.epoll.ctl(
+                ControlOperation::Add,
+                proxy.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, id),
+            )?;
+            self.proxy_map
+                .write()
+                .unwrap()
+                .insert(id, Mutex::new(Box::new(proxy)));
+        }
         self.queue = Some(queue.clone());
         self.mem = Some(mem.clone());
         self.interrupt = Some(interrupt.clone());
@@ -224,10 +278,12 @@ impl VsockMuxer {
                 interrupt.clone(),
                 Arc::clone(&self.timesync_stop),
             );
-            self.timesync_thread = Some(timesync.run());
+            self.timesync_thread = Some(timesync.run()?);
         }
 
         let (sender, receiver) = unbounded();
+        self.reaper_sender = Some(sender.clone());
+        self.reaper_thread = Some(ReaperThread::new(receiver, self.proxy_map.clone()).try_run()?);
 
         let thread = MuxerThread::new(
             self.cid,
@@ -237,26 +293,24 @@ impl VsockMuxer {
             mem,
             queue,
             interrupt.clone(),
-            sender.clone(),
-            self.unix_ipc_port_map.clone().unwrap_or_default(),
-            self.stop_evt
-                .try_clone()
-                .expect("failed to clone vsock stop event"),
+            sender,
+            stop_evt,
         );
-        self.muxer_thread = Some(thread.run());
-
-        self.reaper_sender = Some(sender);
-        let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
-        self.reaper_thread = Some(reaper.run());
+        self.muxer_thread = Some(thread.run()?);
+        Ok(())
     }
 
     /// Stops every background writer and drops connection-local proxy state.
     pub(crate) fn quiesce(&mut self) -> std::io::Result<()> {
-        if let Some(thread) = self.muxer_thread.take() {
+        let mut result = Ok(());
+        if self.muxer_thread.is_some() {
             self.stop_evt.write(1)?;
-            thread
+            result = self
+                .muxer_thread
+                .take()
+                .unwrap()
                 .join()
-                .map_err(|_| std::io::Error::other("vsock muxer thread panicked"))?;
+                .map_err(|_| std::io::Error::other("vsock muxer thread panicked"));
         }
 
         #[cfg(target_os = "macos")]
@@ -264,27 +318,43 @@ impl VsockMuxer {
             let (stopped, changed) = &*self.timesync_stop;
             *stopped.lock().unwrap() = true;
             changed.notify_all();
-            thread
+            let joined = thread
                 .join()
-                .map_err(|_| std::io::Error::other("vsock timesync thread panicked"))?;
+                .map_err(|_| std::io::Error::other("vsock timesync thread panicked"));
+            result = result.and(joined);
         }
 
         // The muxer owned the only other sender. Dropping this endpoint lets the reaper terminate
         // without a second stop protocol.
         self.reaper_sender.take();
         if let Some(thread) = self.reaper_thread.take() {
-            thread
+            let joined = thread
                 .join()
-                .map_err(|_| std::io::Error::other("vsock reaper thread panicked"))?;
+                .map_err(|_| std::io::Error::other("vsock reaper thread panicked"));
+            result = result.and(joined);
         }
 
+        // Listener descriptors survive quiescence; their registrations must not.
+        for listener in self.host_listeners.values() {
+            let _ = self.epoll.ctl(
+                ControlOperation::Delete,
+                listener.as_raw_fd(),
+                &EpollEvent::default(),
+            );
+        }
+        let _ = self.epoll.ctl(
+            ControlOperation::Delete,
+            self.stop_evt.as_raw_fd(),
+            &EpollEvent::default(),
+        );
+        let _ = self.stop_evt.read();
         self.proxy_map.write().unwrap().clear();
         self.dgram_peer_map.lock().unwrap().clear();
         self.rxq.lock().unwrap().clear();
         self.queue = None;
         self.mem = None;
         self.interrupt = None;
-        Ok(())
+        result
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {
@@ -433,6 +503,10 @@ impl VsockMuxer {
     fn process_proxy_create(&self, pkt: &VsockPacket) {
         debug!("proxy create request");
         if let Some(req) = pkt.read_proxy_create() {
+            if self.host_listeners.contains_key(&req.peer_port) {
+                // Host listeners are device-owned, not guest-created TSI sockets.
+                return;
+            }
             debug!(
                 "proxy create request: peer_port={}, type={}",
                 req.peer_port, req._type
@@ -1239,6 +1313,14 @@ impl VsockMuxer {
     }
 }
 
+impl Drop for VsockMuxer {
+    fn drop(&mut self) {
+        if let Err(error) = self.quiesce() {
+            error!("failed to stop vsock workers during device teardown: {error}");
+        }
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -1250,11 +1332,272 @@ mod tests {
     use super::*;
     use crate::virtio::{Descriptor, DescriptorChain};
     use std::io;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::time::{Duration, Instant};
+    use utils::tempdir::TempDir;
     use vm_memory::{Bytes, GuestAddress};
 
     const TEST_CID: u64 = 42;
     const TEST_PORT: u32 = 5000;
     const HEADER: GuestAddress = GuestAddress(0x2000);
+
+    fn listener_muxer(path: &std::path::Path) -> super::super::Result<VsockMuxer> {
+        VsockMuxer::new(
+            TEST_CID,
+            None,
+            Some(HashMap::from([(TEST_PORT, (path.to_path_buf(), true))])),
+            None,
+            None,
+            TsiFlags::empty(),
+        )
+    }
+
+    fn activate_muxer(muxer: &mut VsockMuxer) -> io::Result<()> {
+        use crate::legacy::DummyIrqChip;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-vsock".into()).unwrap();
+        muxer.activate(mem, Arc::new(Mutex::new(VirtQueue::new(256))), interrupt)
+    }
+
+    fn wait_for_host_request(muxer: &VsockMuxer) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(rx) = muxer.rxq.lock().unwrap().pop() {
+                assert!(matches!(
+                    rx,
+                    MuxerRx::OpRequest {
+                        peer_port: TEST_PORT,
+                        ..
+                    }
+                ));
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "host connection never reached the guest RX queue"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn host_listener_is_bound_before_activation_and_owned_until_drop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("host.sock");
+        let muxer = listener_muxer(&path).unwrap();
+        let _pending = UnixStream::connect(&path).unwrap();
+        assert!(matches!(
+            listener_muxer(&path),
+            Err(VsockError::HostListener { .. })
+        ));
+        assert!(path.exists());
+        drop(muxer);
+        assert!(!path.exists());
+        let replacement = listener_muxer(&path).unwrap();
+        drop(replacement);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn host_listener_failure_preserves_existing_paths_and_rolls_back_partial_bind() {
+        let dir = TempDir::new().unwrap();
+        let occupied = dir.as_path().join("occupied");
+        std::fs::write(&occupied, b"owner").unwrap();
+        assert!(listener_muxer(&occupied).is_err());
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"owner");
+        assert!(listener_muxer(&dir.as_path().join("missing/host.sock")).is_err());
+        let duplicate = dir.as_path().join("duplicate.sock");
+        let result = VsockMuxer::new(
+            TEST_CID,
+            None,
+            Some(HashMap::from([
+                (5000, (duplicate.clone(), true)),
+                (5001, (duplicate.clone(), true)),
+            ])),
+            None,
+            None,
+            TsiFlags::empty(),
+        );
+        assert!(matches!(result, Err(VsockError::HostListener { .. })));
+        assert!(
+            !duplicate.exists(),
+            "failed construction leaked its first listener"
+        );
+    }
+
+    #[test]
+    fn host_listener_reactivation_rejects_replaced_path_without_unlinking_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("host.sock");
+        let mut muxer = listener_muxer(&path).unwrap();
+        activate_muxer(&mut muxer).unwrap();
+        muxer.quiesce().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            activate_muxer(&mut muxer).unwrap_err().kind(),
+            io::ErrorKind::AddrNotAvailable
+        );
+        assert!(muxer.proxy_map.read().unwrap().is_empty());
+        assert!(muxer.muxer_thread.is_none());
+        drop(muxer);
+        let _client = UnixStream::connect(&path).unwrap();
+        replacement.accept().unwrap();
+        drop(replacement);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_listener_activation_rolls_back_failed_poll_registration() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("host.sock");
+        let mut muxer = listener_muxer(&path).unwrap();
+        let fd = muxer.host_listeners[&TEST_PORT].as_raw_fd();
+        muxer
+            .epoll
+            .ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, 123),
+            )
+            .unwrap();
+        assert!(activate_muxer(&mut muxer).is_err());
+        assert!(muxer.proxy_map.read().unwrap().is_empty());
+        assert!(muxer.muxer_thread.is_none());
+        assert!(muxer.reaper_thread.is_none());
+        assert!(muxer.mem.is_none());
+        activate_muxer(&mut muxer).unwrap();
+        let _client = UnixStream::connect(&path).unwrap();
+        wait_for_host_request(&muxer);
+    }
+
+    #[test]
+    fn host_listener_accepts_after_every_quiescence_and_drop_joins_workers() {
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let dir = TempDir::new().unwrap();
+            let path = dir.as_path().join("host.sock");
+            let mut muxer = listener_muxer(&path).unwrap();
+            for _ in 0..8 {
+                activate_muxer(&mut muxer).unwrap();
+                assert_eq!(
+                    activate_muxer(&mut muxer).unwrap_err().kind(),
+                    io::ErrorKind::AlreadyExists
+                );
+                let _client = UnixStream::connect(&path).unwrap();
+                wait_for_host_request(&muxer);
+                muxer.quiesce().unwrap();
+                assert!(path.exists());
+                assert!(muxer.proxy_map.read().unwrap().is_empty());
+            }
+            activate_muxer(&mut muxer).unwrap();
+            drop(muxer);
+            assert!(!path.exists());
+            done.send(()).unwrap();
+        });
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("listener workers failed to stop");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_one_launch_keeps_other_listener_usable() {
+        let dir = TempDir::new().unwrap();
+        let first_path = dir.as_path().join("first.sock");
+        let second_path = dir.as_path().join("second.sock");
+        let first = listener_muxer(&first_path).unwrap();
+        let mut second = listener_muxer(&second_path).unwrap();
+        activate_muxer(&mut second).unwrap();
+        drop(first);
+        assert!(!first_path.exists());
+        let _client = UnixStream::connect(&second_path).unwrap();
+        wait_for_host_request(&second);
+    }
+
+    #[test]
+    fn guest_tsi_create_cannot_replace_host_listener() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("host.sock");
+        let mut muxer = listener_muxer(&path).unwrap();
+        muxer.tsi_flags = TsiFlags::HIJACK_INET | TsiFlags::HIJACK_UNIX;
+        activate_muxer(&mut muxer).unwrap();
+        let mem = muxer.mem.as_ref().unwrap().clone();
+        let id = ((TEST_PORT as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+        let listener_fd = muxer.host_listeners[&TEST_PORT].as_raw_fd();
+        for family in [libc::AF_INET, libc::AF_UNIX] {
+            for kind in [defs::SOCK_STREAM, defs::SOCK_DGRAM] {
+                let _ = tx_packet(&mem, TEST_CID, uapi::VSOCK_HOST_CID, uapi::VSOCK_OP_RW);
+                mem.write_obj(defs::TSI_PROXY_CREATE.to_le(), GuestAddress(HEADER.0 + 20))
+                    .unwrap();
+                mem.write_obj(8u32.to_le(), GuestAddress(HEADER.0 + 24))
+                    .unwrap();
+                mem.write_obj(
+                    Descriptor {
+                        addr: HEADER.0,
+                        len: VSOCK_PKT_HDR_SIZE as u32,
+                        flags: 1,
+                        next: 1,
+                    },
+                    GuestAddress(0x1000),
+                )
+                .unwrap();
+                mem.write_obj(
+                    Descriptor {
+                        addr: 0x3000,
+                        len: 8,
+                        flags: 0,
+                        next: 0,
+                    },
+                    GuestAddress(0x1010),
+                )
+                .unwrap();
+                mem.write_obj(TEST_PORT.to_le(), GuestAddress(0x3000))
+                    .unwrap();
+                mem.write_obj((family as u16).to_le(), GuestAddress(0x3004))
+                    .unwrap();
+                mem.write_obj((kind as u16).to_le(), GuestAddress(0x3006))
+                    .unwrap();
+                let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 2, 0).unwrap();
+                let pkt = VsockPacket::from_tx_virtq_head(&head).unwrap();
+                muxer.send_dgram_pkt(&pkt).unwrap();
+                let map = muxer.proxy_map.read().unwrap();
+                let listener = map[&id].lock().unwrap();
+                assert_eq!(listener.pollable(), listener_fd);
+                assert_eq!(
+                    listener.status(),
+                    super::super::proxy::ProxyStatus::WaitingOnAccept
+                );
+            }
+        }
+        let _client = UnixStream::connect(&path).unwrap();
+        wait_for_host_request(&muxer);
+    }
+
+    #[test]
+    fn guest_stream_packets_cannot_release_or_panic_host_listener() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("host.sock");
+        let mut muxer = listener_muxer(&path).unwrap();
+        activate_muxer(&mut muxer).unwrap();
+        let mem = muxer.mem.as_ref().unwrap().clone();
+        let id = ((TEST_PORT as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+        for op in 0..=uapi::VSOCK_OP_CREDIT_UPDATE {
+            let _ = tx_packet(&mem, TEST_CID, uapi::VSOCK_HOST_CID, op);
+            mem.write_obj(TEST_PORT.to_le(), GuestAddress(HEADER.0 + 16))
+                .unwrap();
+            mem.write_obj(defs::TSI_PROXY_PORT.to_le(), GuestAddress(HEADER.0 + 20))
+                .unwrap();
+            let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 1, 0).unwrap();
+            let pkt = VsockPacket::from_tx_virtq_head(&head).unwrap();
+            muxer.send_stream_pkt(&pkt).unwrap();
+            assert!(muxer.proxy_map.read().unwrap().contains_key(&id));
+        }
+        let _client = UnixStream::connect(&path).unwrap();
+        wait_for_host_request(&muxer);
+    }
 
     #[derive(Default)]
     struct RecordingBackend {
@@ -1298,7 +1641,8 @@ mod tests {
                 backend.clone() as Arc<dyn VsockDatagramPortBackend>,
             )])),
             TsiFlags::empty(),
-        );
+        )
+        .unwrap();
         muxer.mem = Some(mem.clone());
         muxer.queue = Some(Arc::new(Mutex::new(VirtQueue::new(256))));
         muxer
@@ -1431,7 +1775,7 @@ mod tests {
 
     #[test]
     fn datagram_peer_limit_evicts_the_least_recently_used_peer_per_port() {
-        let muxer = VsockMuxer::new(3, None, None, None, None, TsiFlags::empty());
+        let muxer = VsockMuxer::new(3, None, None, None, None, TsiFlags::empty()).unwrap();
         {
             let mut peers = muxer.dgram_peer_map.lock().unwrap();
             for source_port in 1..=MAX_DGRAM_PEERS_PER_PORT as u32 {

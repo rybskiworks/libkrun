@@ -64,16 +64,19 @@ impl Vsock {
         custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
         tsi_flags: TsiFlags,
     ) -> super::Result<Vsock> {
+        let muxer = VsockMuxer::new(
+            cid,
+            host_port_map,
+            unix_ipc_port_map,
+            custom_port_map,
+            custom_dgram_port_map,
+            tsi_flags,
+        );
+        #[cfg(unix)]
+        let muxer = muxer?;
         Ok(Vsock {
             cid,
-            muxer: VsockMuxer::new(
-                cid,
-                host_port_map,
-                unix_ipc_port_map,
-                custom_port_map,
-                custom_dgram_port_map,
-                tsi_flags,
-            ),
+            muxer,
             queue_rx: None,
             queue_tx: None,
             queue_ev: None,
@@ -262,17 +265,15 @@ impl VirtioDevice for Vsock {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
+        if self.is_activated() {
+            return Err(ActivateError::BadActivate);
+        }
         if queues.len() != defs::NUM_QUEUES {
             error!(
                 "Cannot perform activate. Expected {} queue(s), got {}",
                 defs::NUM_QUEUES,
                 queues.len()
             );
-            return Err(ActivateError::BadActivate);
-        }
-
-        if self.activate_evt.write(1).is_err() {
-            error!("Cannot write to activate_evt",);
             return Err(ActivateError::BadActivate);
         }
 
@@ -289,22 +290,29 @@ impl VirtioDevice for Vsock {
         self.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
         self.queue_rx = Some(Arc::new(Mutex::new(rx_queue)));
         self.queue_ev = Some(evq);
-        #[cfg(windows)]
-        self.muxer
-            .activate(
-                mem.clone(),
-                self.queue_rx.clone().unwrap(),
-                interrupt.clone(),
-            )
-            .map_err(ActivateError::EpollCtl)?;
-        #[cfg(unix)]
-        self.muxer.activate(
+        if let Err(error) = self.muxer.activate(
             mem.clone(),
             self.queue_rx.clone().unwrap(),
             interrupt.clone(),
-        );
+        ) {
+            self.queue_rx = None;
+            self.queue_tx = None;
+            self.queue_ev = None;
+            self.queue_events.clear();
+            return Err(ActivateError::EpollCtl(error));
+        }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
+        if self.activate_evt.write(1).is_err() {
+            let _ = self.muxer.quiesce();
+            self.device_state = DeviceState::Inactive;
+            self.queue_rx = None;
+            self.queue_tx = None;
+            self.queue_ev = None;
+            self.queue_events.clear();
+            error!("Cannot write to activate_evt");
+            return Err(ActivateError::BadActivate);
+        }
 
         Ok(())
     }
@@ -395,6 +403,35 @@ mod tests {
                 DeviceQueue::new(Queue::new(config.size), Arc::new(EventFd::new(0).unwrap()))
             })
             .collect()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_host_listener_activation_is_not_announced() {
+        let dir = utils::tempdir::TempDir::new().unwrap();
+        let path = dir.as_path().join("host.sock");
+        let mut vsock = Vsock::new(
+            3,
+            None,
+            Some(HashMap::from([(5000, (path.clone(), true))])),
+            None,
+            None,
+            TsiFlags::empty(),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-vsock".into()).unwrap();
+        assert!(vsock.activate(mem, interrupt, queues()).is_err());
+        assert!(!vsock.is_activated());
+        assert_eq!(
+            vsock.activate_evt.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(vsock.queue_rx.is_none());
+        assert!(vsock.queue_tx.is_none());
+        assert!(vsock.queue_ev.is_none());
     }
 
     #[test]

@@ -208,6 +208,14 @@ pub enum VsockError {
     UnwritableDescriptor,
     /// EventFd error
     EventFd(std::io::Error),
+    /// Host transport initialization failed before the device became usable.
+    Transport(std::io::Error),
+    /// A configured host listener could not be bound.
+    HostListener {
+        port: u32,
+        path: std::path::PathBuf,
+        error: std::io::Error,
+    },
 }
 
 type Result<T> = std::result::Result<T, VsockError>;
