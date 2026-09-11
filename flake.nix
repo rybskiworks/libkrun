@@ -49,7 +49,10 @@
           rustPlatform = pkgs.makeRustPlatform {
             inherit (pkgs.fenix.stable) cargo rustc;
           };
-          cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+          cargoDeps = rustPlatform.importCargoLock {
+            lockFile = ./Cargo.lock;
+            outputHashes."msb-vm-memory-0.18.0-msb.1" = "sha256-aZc0jr3XqrZHyLnQz/NwjUCfsxy7YNAsqjVWrqHYH30=";
+          };
           initLdflags = "-L${pkgs.glibc.static}/lib";
           # Bindgen loads the pinned libclang from LIBCLANG_PATH at build time.
           cargoFlags = "--locked --offline --features msb_krun_input/bindgen_clang_runtime";
@@ -175,6 +178,36 @@
                   cargo fmt --check
                   touch $out/ok
                 '';
+
+            # State codecs, private mappings and device protocol tests do not
+            # open KVM. Keep these distinct from boot/restore acceptance tests.
+            unit-state = libkrun.overrideAttrs {
+              pname = "libkrun-unit-state";
+              buildPhase = ''
+                runHook preBuild
+                export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+                export CARGO_TARGET_DIR="$TMPDIR/target"
+                export CARGO_HOME="$TMPDIR/cargo-home"
+                export CARGO_PROFILE_TEST_DEBUG=0
+                export PROPTEST_CASES=256
+                export PROPTEST_RNG_SEED=20260910
+                export PROPTEST_MAX_SHRINK_ITERS=4096
+                mkdir -p "$CARGO_HOME"
+                make init/init INIT_LDFLAGS="${initLdflags}"
+                for scope in memory_state private_memory device_state execution_state vmm_config::vsock; do
+                  cargo test --locked --offline -p msb_krun_vmm --lib --features blk,net,devices/net "$scope::tests::"
+                done
+                cargo test --locked --offline -p msb_krun_devices --lib --features blk,net virtio::vmgenid::
+                cargo test --locked --offline -p msb_krun_devices --lib --features blk,net virtio::block::backend::tests::
+                cargo test --locked --offline -p msb_krun_devices --lib --features blk,net virtio::vsock::
+                cargo test --locked --offline -p msb_krun_utils --lib epoll::tests::
+                runHook postBuild
+              '';
+              installPhase = ''
+                mkdir -p $out
+                touch $out/ok
+              '';
+            };
 
             # Unit scope: only workspace unit tests that don't need KVM
             # (e.g. `cargo test -p msb_krun --lib` builder validation).

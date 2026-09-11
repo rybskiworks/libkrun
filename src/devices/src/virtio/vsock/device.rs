@@ -15,7 +15,7 @@ use vm_memory::GuestMemoryMmap;
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
-    VirtioDevice,
+    VirtioDevice, VirtioStateError, VmmExitObserver,
 };
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
@@ -45,6 +45,7 @@ pub struct Vsock {
     pub(crate) muxer: VsockMuxer,
     pub(crate) queue_rx: Option<Arc<Mutex<VirtQueue>>>,
     pub(crate) queue_tx: Option<Arc<Mutex<VirtQueue>>>,
+    pub(crate) queue_ev: Option<VirtQueue>,
     // Queue events are stored separately for event handling.
     pub(crate) queue_events: Vec<Arc<EventFd>>,
     pub(crate) avail_features: u64,
@@ -63,18 +64,22 @@ impl Vsock {
         custom_dgram_port_map: Option<HashMap<u32, Arc<dyn VsockDatagramPortBackend>>>,
         tsi_flags: TsiFlags,
     ) -> super::Result<Vsock> {
+        let muxer = VsockMuxer::new(
+            cid,
+            host_port_map,
+            unix_ipc_port_map,
+            custom_port_map,
+            custom_dgram_port_map,
+            tsi_flags,
+        );
+        #[cfg(unix)]
+        let muxer = muxer?;
         Ok(Vsock {
             cid,
-            muxer: VsockMuxer::new(
-                cid,
-                host_port_map,
-                unix_ipc_port_map,
-                custom_port_map,
-                custom_dgram_port_map,
-                tsi_flags,
-            ),
+            muxer,
             queue_rx: None,
             queue_tx: None,
+            queue_ev: None,
             queue_events: Vec::new(),
             avail_features: AVAIL_FEATURES,
             acked_features: 0,
@@ -260,6 +265,9 @@ impl VirtioDevice for Vsock {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
+        if self.is_activated() {
+            return Err(ActivateError::BadActivate);
+        }
         if queues.len() != defs::NUM_QUEUES {
             error!(
                 "Cannot perform activate. Expected {} queue(s), got {}",
@@ -269,35 +277,237 @@ impl VirtioDevice for Vsock {
             return Err(ActivateError::BadActivate);
         }
 
-        if self.activate_evt.write(1).is_err() {
-            error!("Cannot write to activate_evt",);
-            return Err(ActivateError::BadActivate);
-        }
-
         // Store queue events for event handling.
         self.queue_events = queues.iter().map(|dq| dq.event.clone()).collect();
 
         // Extract queues from DeviceQueues and wrap in Arc<Mutex<>>.
         let mut queues_vec: Vec<VirtQueue> = queues.into_iter().map(|dq| dq.queue).collect();
         // Note: EVQ (index 2) is currently unused, we just take it to maintain the vec.
-        let _evq = queues_vec.pop().unwrap();
+        let evq = queues_vec.pop().unwrap();
         let tx_queue = queues_vec.pop().unwrap();
         let rx_queue = queues_vec.pop().unwrap();
 
         self.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
         self.queue_rx = Some(Arc::new(Mutex::new(rx_queue)));
-        self.muxer.activate(
+        self.queue_ev = Some(evq);
+        if let Err(error) = self.muxer.activate(
             mem.clone(),
             self.queue_rx.clone().unwrap(),
             interrupt.clone(),
-        );
+        ) {
+            self.queue_rx = None;
+            self.queue_tx = None;
+            self.queue_ev = None;
+            self.queue_events.clear();
+            return Err(ActivateError::EpollCtl(error));
+        }
 
         self.device_state = DeviceState::Activated(mem, interrupt);
+        if self.activate_evt.write(1).is_err() {
+            let _ = self.muxer.quiesce();
+            self.device_state = DeviceState::Inactive;
+            self.queue_rx = None;
+            self.queue_tx = None;
+            self.queue_ev = None;
+            self.queue_events.clear();
+            error!("Cannot write to activate_evt");
+            return Err(ActivateError::BadActivate);
+        }
 
         Ok(())
     }
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    fn reset(&mut self) -> bool {
+        self.quiesce().is_ok()
+    }
+
+    fn supports_quiesce(&self) -> bool {
+        true
+    }
+
+    fn quiesce(&mut self) -> Result<Vec<DeviceQueue>, VirtioStateError> {
+        if !self.device_state.is_activated() {
+            return Err(VirtioStateError::InvalidLifecycle(
+                "vsock must be activated before quiescence",
+            ));
+        }
+
+        // Stop muxer, reaper, and platform time-sync writers before reclaiming queue ownership.
+        // Active streams intentionally reset; agent and application protocols reconnect after
+        // resume rather than serializing host socket handles.
+        self.muxer.quiesce().map_err(VirtioStateError::Device)?;
+        let rx = take_shared_queue(
+            self.queue_rx
+                .take()
+                .ok_or(VirtioStateError::InvalidLifecycle(
+                    "vsock RX queue is missing",
+                ))?,
+            "vsock RX queue still has an owner after muxer stop",
+        )?;
+        let tx = take_shared_queue(
+            self.queue_tx
+                .take()
+                .ok_or(VirtioStateError::InvalidLifecycle(
+                    "vsock TX queue is missing",
+                ))?,
+            "vsock TX queue still has an owner after muxer stop",
+        )?;
+        let ev = self
+            .queue_ev
+            .take()
+            .ok_or(VirtioStateError::InvalidLifecycle(
+                "vsock event queue is missing",
+            ))?;
+        self.device_state = DeviceState::Inactive;
+        Ok(vec![
+            DeviceQueue::new(rx, self.queue_events[RXQ_INDEX].clone()),
+            DeviceQueue::new(tx, self.queue_events[TXQ_INDEX].clone()),
+            DeviceQueue::new(ev, self.queue_events[EVQ_INDEX].clone()),
+        ])
+    }
+}
+
+impl VmmExitObserver for Vsock {
+    fn on_vmm_exit(&mut self, _exit_code: i32) {
+        // Normal VMM shutdown uses _exit(), so destructors alone do not run.
+        #[cfg(unix)]
+        let result = self.muxer.retire();
+        #[cfg(windows)]
+        let result = self.muxer.quiesce();
+        if let Err(error) = result {
+            error!("failed to stop vsock transport on VMM exit: {error}");
+        }
+    }
+}
+
+fn take_shared_queue(
+    queue: Arc<Mutex<VirtQueue>>,
+    error: &'static str,
+) -> Result<VirtQueue, VirtioStateError> {
+    Arc::try_unwrap(queue)
+        .map_err(|_| VirtioStateError::Incompatible(error.to_string()))?
+        .into_inner()
+        .map_err(|_| VirtioStateError::Incompatible("vsock queue mutex is poisoned".to_string()))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vm_memory::GuestAddress;
+
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::{DeviceQueue, InterruptTransport, Queue};
+
+    use super::*;
+
+    fn queues() -> Vec<DeviceQueue> {
+        defs::QUEUE_CONFIG
+            .iter()
+            .map(|config| {
+                DeviceQueue::new(Queue::new(config.size), Arc::new(EventFd::new(0).unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_host_listener_activation_is_not_announced() {
+        let dir = utils::tempdir::TempDir::new().unwrap();
+        let path = dir.as_path().join("host.sock");
+        let mut vsock = Vsock::new(
+            3,
+            None,
+            Some(HashMap::from([(5000, (path.clone(), true))])),
+            None,
+            None,
+            TsiFlags::empty(),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-vsock".into()).unwrap();
+        assert!(vsock.activate(mem, interrupt, queues()).is_err());
+        assert!(!vsock.is_activated());
+        assert_eq!(
+            vsock.activate_evt.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(vsock.queue_rx.is_none());
+        assert!(vsock.queue_tx.is_none());
+        assert!(vsock.queue_ev.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exit_observer_releases_listener_before_process_exit() {
+        let dir = utils::tempdir::TempDir::new().unwrap();
+        let path = dir.as_path().join("host.sock");
+        for active in [false, true] {
+            let mut vsock = Vsock::new(
+                3,
+                None,
+                Some(HashMap::from([(5000, (path.clone(), true))])),
+                None,
+                None,
+                TsiFlags::empty(),
+            )
+            .unwrap();
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+            let interrupt =
+                InterruptTransport::new(DummyIrqChip::new().into(), "test-vsock".into()).unwrap();
+            if active {
+                vsock
+                    .activate(mem.clone(), interrupt.clone(), queues())
+                    .unwrap();
+            }
+            assert!(path.exists());
+            vsock.on_vmm_exit(0);
+            assert!(!path.exists());
+            vsock.on_vmm_exit(0);
+            assert!(vsock
+                .muxer
+                .activate(mem, Arc::new(Mutex::new(Queue::new(256))), interrupt)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn vsock_quiesce_joins_background_workers_and_is_reactivatable() {
+        let (completed, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            check_repeated_quiescence();
+            completed.send(()).unwrap();
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("vsock workers must stop promptly on every activation");
+        worker.join().unwrap();
+    }
+
+    fn check_repeated_quiescence() {
+        let mut vsock = Vsock::new(3, None, None, None, None, TsiFlags::empty()).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-vsock".into()).unwrap();
+
+        let mut queues = queues();
+        for _ in 0..8 {
+            vsock
+                .activate(mem.clone(), interrupt.clone(), queues)
+                .unwrap();
+            queues = vsock.quiesce().unwrap();
+            assert_eq!(queues.len(), defs::NUM_QUEUES);
+            assert!(!vsock.is_activated());
+        }
     }
 }

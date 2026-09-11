@@ -37,7 +37,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::{Error, Vmm};
+use super::{Error, PauseGeneration, VcpuControlRequestId, Vmm, VmmExecutionState};
+use crate::memory_state::{MemoryGenerationLedger, MemoryTopologyGeneration};
 
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 use crate::device_manager::legacy::PortIODeviceManager;
@@ -145,6 +146,8 @@ use vm_memory::mmap::MmapRegion;
 use vm_memory::Address;
 use vm_memory::Bytes;
 use vm_memory::GuestMemoryBackend;
+#[cfg(not(feature = "tee"))]
+use vm_memory::GuestMemoryRegion;
 #[cfg(all(
     not(feature = "tee"),
     any(
@@ -165,6 +168,8 @@ static EDK2_BINARY: &[u8] = include_bytes!("../KRUN_EFI.silent.fd");
 /// Errors associated with starting the instance.
 #[derive(Debug)]
 pub enum StartMicrovmError {
+    /// Invalid or unsupported private guest-memory backing.
+    PrivateMemoryBacking(io::Error),
     /// Unable to attach block device to Vmm.
     AttachBlockDevice(io::Error),
     #[cfg(target_os = "macos")]
@@ -287,6 +292,8 @@ pub enum StartMicrovmError {
     RegisterNetDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO microsandbox metrics device or add it to the MMIO Bus.
     RegisterMsbMetricsDevice(device_manager::mmio::Error),
+    /// Cannot initialize the private VM-generation device or add it to the MMIO Bus.
+    RegisterGenerationDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Rng device or add a device to the MMIO Bus.
     RegisterRngDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Snd device or add a device to the MMIO Bus.
@@ -413,6 +420,9 @@ impl Display for StartMicrovmError {
                 let mut err_msg = format!("{err:?}");
                 err_msg = err_msg.replace('\"', "");
                 write!(f, "Invalid Memory Configuration: {err_msg}")
+            }
+            PrivateMemoryBacking(ref err) => {
+                write!(f, "Cannot install private memory backing: {err}")
             }
             HostMemoryPolicy(ref err) => {
                 write!(f, "Cannot apply host memory policy: {err}")
@@ -613,6 +623,14 @@ impl Display for StartMicrovmError {
                 write!(
                     f,
                     "Cannot initialize a MMIO microsandbox metrics Device or add a device to the MMIO Bus. {err_msg}"
+                )
+            }
+            RegisterGenerationDevice(ref err) => {
+                let mut err_msg = format!("{err}");
+                err_msg = err_msg.replace('\"', "");
+                write!(
+                    f,
+                    "Cannot initialize the VM-generation Device or add it to the MMIO Bus. {err_msg}"
                 )
             }
             RegisterRngDevice(ref err) => {
@@ -1007,6 +1025,53 @@ impl devices::legacy::gic::GICDevice for WhpIrqChip {
 
 #[cfg(target_os = "windows")]
 impl IrqChipT for WhpIrqChip {
+    #[cfg(target_arch = "x86_64")]
+    fn capture_state(&self) -> std::result::Result<Option<Vec<u8>>, devices::Error> {
+        let state = self
+            .ioapic
+            .lock()
+            .map_err(|_| devices::Error::IoError(io::Error::other("IOAPIC mutex poisoned")))?;
+        let bytes = bincode::serde::encode_to_vec(
+            (
+                state.id,
+                state.ioregsel,
+                state.ioredtbl.to_vec(),
+                state.version,
+            ),
+            bincode::config::standard(),
+        )
+        .map_err(|error| devices::Error::IoError(io::Error::other(error.to_string())))?;
+        Ok(Some(bytes))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn restore_state(&mut self, bytes: Option<&[u8]>) -> std::result::Result<(), devices::Error> {
+        let invalid = |message: String| {
+            devices::Error::IoError(io::Error::new(io::ErrorKind::InvalidData, message))
+        };
+        let bytes = bytes.ok_or_else(|| invalid("missing WHP IOAPIC state".into()))?;
+        let ((id, ioregsel, entries, version), used): ((u8, u8, Vec<u64>, u8), usize) =
+            bincode::serde::decode_from_slice(
+                bytes,
+                bincode::config::standard().with_limit::<4096>(),
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+        if used != bytes.len()
+            || entries.len() != X86_IOAPIC_NUM_PINS
+            || version != X86_IOAPIC_VERSION
+        {
+            return Err(invalid("WHP IOAPIC state layout mismatch".into()));
+        }
+        let mut state = self
+            .ioapic
+            .lock()
+            .map_err(|_| invalid("IOAPIC mutex poisoned".into()))?;
+        state.id = id;
+        state.ioregsel = ioregsel;
+        state.ioredtbl.copy_from_slice(&entries);
+        Ok(())
+    }
+
     fn get_mmio_addr(&self) -> u64 {
         #[cfg(target_arch = "x86_64")]
         {
@@ -1563,6 +1628,8 @@ pub fn build_microvm_paused(
         )?;
 
         let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
+        #[cfg(not(feature = "tee"))]
+        let kernel_boot = kernel_boot && vm_resources.private_memory_backing.is_none();
 
         vcpus = create_vcpus_x86_64(
             &vm,
@@ -1659,8 +1726,8 @@ pub fn build_microvm_paused(
             let vcpu_count = vcpu_config.max_vcpu_count as u64;
             let gic = match KvmGicV3::new(vm.fd(), vcpu_count) {
                 Ok(gicv3) => IrqChipDevice::new(Box::new(gicv3)),
-                Err(_) => {
-                    warn!("KVM GICv3 creation failed, falling back to KVM GICv2");
+                Err(error) => {
+                    warn!("KVM GICv3 creation failed ({error}), falling back to KVM GICv2");
                     IrqChipDevice::new(Box::new(KvmGicV2::new(vm.fd(), vcpu_count)))
                 }
             };
@@ -1753,11 +1820,32 @@ pub fn build_microvm_paused(
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
+        control_request_id: VcpuControlRequestId::INITIAL,
+        execution_state: VmmExecutionState::Paused(PauseGeneration::INITIAL),
+        execution_restore_allowed: true,
+        memory_restore_allowed: true,
+        memory_ledger: MemoryGenerationLedger::new(MemoryTopologyGeneration::new(1)),
+        memory_access: devices::virtio::MemoryAccessDomain::new(),
+        memory_tracking_active: false,
+        memory_tracking_needs_rearm: false,
+        pending_dirty_ranges: Vec::new(),
+        carried_dirty_ranges: Vec::new(),
+        pending_access_mode: None,
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
+        #[cfg(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(target_os = "windows", target_arch = "x86_64")
+        ))]
+        irqchip: intc.clone(),
+        #[cfg(feature = "blk")]
+        quiesced_virtio_devices: Default::default(),
         #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         pio_device_manager,
     };
@@ -1947,22 +2035,40 @@ pub fn build_microvm_paused(
         attach_snd_device(&mut vmm, intc.clone())?;
     }
 
+    // Keep this appended after established devices so enabling generation support does not
+    // renumber their MMIO addresses or interrupt assignments.
+    #[cfg(not(feature = "tee"))]
+    if let Some(generation_device) = vm_resources.generation_device.clone() {
+        attach_generation_device(&mut vmm, event_manager, intc.clone(), generation_device)?;
+        trace.mark("vmgenid.attached");
+    }
+
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
         vmm.kernel_cmdline.insert_str(s)?;
     };
 
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
+    #[cfg(not(feature = "tee"))]
+    let configure_boot_memory = vm_resources.private_memory_backing.is_none();
+    #[cfg(feature = "tee")]
+    let configure_boot_memory = true;
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-    load_cmdline(&vmm)?;
+    if configure_boot_memory {
+        load_cmdline(&vmm)?;
+    }
 
-    vmm.configure_system(
-        vcpus.as_slice(),
-        &intc,
-        &payload_config.initrd_config,
-        &vm_resources.smbios_oem_strings,
-    )
-    .map_err(StartMicrovmError::Internal)?;
+    // Restored RAM already includes the captured command line, page tables and FDT. Writing new
+    // boot metadata here both corrupts that state and needlessly privatizes clean backing pages.
+    if configure_boot_memory {
+        vmm.configure_system(
+            vcpus.as_slice(),
+            &intc,
+            &payload_config.initrd_config,
+            &vm_resources.smbios_oem_strings,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+    }
     trace.mark("system.configured");
 
     #[cfg(feature = "tee")]
@@ -2479,9 +2585,35 @@ fn load_payload(
                     return Err(StartMicrovmError::MissingKernelConfig);
                 };
 
-            let kernel_region = unsafe {
-                MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
-                    .map_err(StartMicrovmError::InvalidKernelBundle)?
+            let kernel_region = if _vm_resources.private_memory_boot {
+                let ranges = [(GuestAddress(kernel_guest_addr), kernel_size)];
+                let backing = crate::private_memory::PrivateMemoryBacking::zeroed(&ranges)
+                    .map_err(StartMicrovmError::PrivateMemoryBacking)?;
+                let memory = backing
+                    .map(&ranges)
+                    .map_err(StartMicrovmError::PrivateMemoryBacking)?;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(kernel_host_addr as *const u8, kernel_size)
+                };
+                memory
+                    .write_slice(bytes, GuestAddress(kernel_guest_addr))
+                    .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
+                let (_, region) = memory
+                    .remove_region(GuestAddress(kernel_guest_addr), kernel_size as u64)
+                    .map_err(StartMicrovmError::GuestMemoryRegionCollection)?;
+                return Ok((
+                    guest_mem
+                        .insert_region(region)
+                        .map_err(StartMicrovmError::GuestMemoryRegionCollection)?,
+                    GuestAddress(kernel_entry_addr),
+                    None,
+                    None,
+                ));
+            } else {
+                unsafe {
+                    MmapRegion::build_raw(kernel_host_addr as *mut u8, kernel_size, 0, 0)
+                        .map_err(StartMicrovmError::InvalidKernelBundle)?
+                }
             };
 
             Ok((
@@ -2643,6 +2775,18 @@ fn create_guest_memory_with_placement(
     // higher-level `msb_krun` builder having validated this placement contract.
     validate_vmm_numa_topology(vm_resources, mem_size)?;
 
+    #[cfg(not(feature = "tee"))]
+    if (vm_resources.private_memory_backing.is_some() || vm_resources.private_memory_boot)
+        && vm_resources.numa_topology.is_some()
+    {
+        // These combinations require backing-aware discard/placement before they can be exposed.
+        // Never allow legacy MADV_DONTNEED to resurrect bytes from an immutable RAM image.
+        return Err(StartMicrovmError::PrivateMemoryBacking(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private memory with NUMA placement requires backing-aware placement support",
+        )));
+    }
+
     let mem_size = mem_size << 20;
 
     #[cfg(not(feature = "efi"))]
@@ -2798,6 +2942,15 @@ fn create_guest_memory_with_placement(
         MemoryPlacementState::inherited(),
     );
 
+    #[cfg(not(feature = "tee"))]
+    let guest_mem = if vm_resources.private_memory_boot {
+        crate::private_memory::PrivateMemoryBacking::zeroed(&arch_mem_regions)
+            .and_then(|backing| backing.map(&arch_mem_regions))
+            .map_err(StartMicrovmError::PrivateMemoryBacking)?
+    } else {
+        guest_mem
+    };
+
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
 
@@ -2810,6 +2963,21 @@ fn create_guest_memory_with_placement(
                 .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
         }
     }
+
+    // Payload preparation above resolves the exact kernel/firmware topology using bounded boot
+    // writes, not a full memory restore. Replace it before hypervisor registration or device use.
+    #[cfg(not(feature = "tee"))]
+    let guest_mem = if let Some(backing) = &vm_resources.private_memory_backing {
+        let expected = guest_mem
+            .iter()
+            .map(|region| (region.start_addr(), region.len() as usize))
+            .collect::<Vec<_>>();
+        backing
+            .map(&expected)
+            .map_err(StartMicrovmError::PrivateMemoryBacking)?
+    } else {
+        guest_mem
+    };
 
     crate::metrics::install_host_resident_memory_sampler(
         &vm_resources.metrics,
@@ -3913,8 +4081,7 @@ fn create_vcpus_windows(
     // One router shared by all vCPU threads: INIT/SIPI writes trap on the
     // sending vCPU and are applied to the parked target APs through it.
     #[cfg(target_arch = "x86_64")]
-    let sipi_router =
-        std::sync::Arc::new(crate::windows::vstate::ApStartupRouter::new(create_count));
+    let sipi_router = vm.sipi_router();
     for cpu_index in 0..create_count {
         let mut vcpu = vm
             .create_vcpu(
@@ -3995,6 +4162,7 @@ fn create_vcpus_aarch64(
             Some(boot_receiver),
             exit_evt.try_clone().map_err(Error::EventFd)?,
             vcpu_list.clone(),
+            _vm.dirty_tracker(),
             nested_enabled,
             metrics.clone(),
         )
@@ -4058,7 +4226,12 @@ fn attach_mmio_device(
     intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::mmio::Error> {
-    let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
+    let mmio_device = MmioTransport::new_with_memory_access(
+        vmm.guest_memory().clone(),
+        intc,
+        device,
+        vmm.memory_access_domain(),
+    )?;
 
     let type_id = mmio_device.locked_device().device_type();
     let _cmdline = &mut vmm.kernel_cmdline;
@@ -4537,6 +4710,9 @@ fn attach_vsock_device(
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc, vsock.clone()).map_err(RegisterVsockDevice)?;
 
+    // The process exit path bypasses destructors, just as for console teardown.
+    vmm.exit_observers.push(vsock.clone());
+
     Ok(())
 }
 
@@ -4607,6 +4783,27 @@ fn attach_cpu_device(
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_mmio_device(vmm, id, intc.clone(), cpu_device).map_err(RegisterBalloonDevice)?;
+
+    Ok(())
+}
+
+#[cfg(not(feature = "tee"))]
+fn attach_generation_device(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    generation_device: Arc<Mutex<devices::virtio::Generation>>,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    event_manager
+        .add_subscriber(generation_device.clone())
+        .map_err(RegisterEvent)?;
+
+    let id = String::from(generation_device.lock().unwrap().id());
+
+    // The device mutex must not be held while the transport takes ownership of the device.
+    attach_mmio_device(vmm, id, intc, generation_device).map_err(RegisterGenerationDevice)?;
 
     Ok(())
 }
@@ -4995,6 +5192,28 @@ pub mod tests {
 
     #[test]
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    fn windows_ioapic_state_round_trip_and_reject_trailing_bytes() {
+        // This only accesses userspace routing state; no WHP call uses the
+        // null partition. It can run on Windows ARM's x86 emulation as well.
+        let source = WhpIrqChip::new(0, 2);
+        {
+            let mut state = source.ioapic.lock().unwrap();
+            state.id = 3;
+            state.ioregsel = 0x8f;
+            state.ioredtbl[63] = (1_u64 << 56) | 0x45;
+        }
+        let bytes = source.capture_state().unwrap().unwrap();
+        let mut destination = WhpIrqChip::new(0, 2);
+        destination.restore_state(Some(&bytes)).unwrap();
+        assert_eq!(destination.capture_state().unwrap().unwrap(), bytes);
+        let mut invalid = bytes;
+        invalid.push(0);
+        assert!(destination.restore_state(Some(&invalid)).is_err());
+        assert!(destination.restore_state(None).is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     fn windows_ioapic_programs_its_last_pin() {
         let mut ioapic = WhpIoApicState::new();
 
@@ -5114,8 +5333,8 @@ pub mod tests {
     fn test_create_vcpus_aarch64() {
         let (guest_memory, arch_memory_info, _shm_manager, _payload_config) =
             default_guest_memory(128).unwrap();
-        let vm = setup_vm(&guest_memory, false, vcpu_config.vcpu_count).unwrap();
         let vcpu_count = 2;
+        let vm = setup_vm(&guest_memory, false, vcpu_count).unwrap();
 
         let vcpu_config = VcpuConfig {
             vcpu_count,

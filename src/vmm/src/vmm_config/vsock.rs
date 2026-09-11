@@ -33,7 +33,7 @@ pub enum VsockConfigError {
     CreateVsockDevice(VsockError),
     /// A custom datagram route overlaps a device-owned protocol port.
     ReservedDatagramPort { port: u32, owner: &'static str },
-    /// A guest CID was explicitly requested that is reserved for the host.
+    /// A guest CID was explicitly requested that is reserved or a wildcard.
     InvalidGuestCid(u32),
     /// A guest CID was explicitly requested that is already assigned to another VM.
     GuestCidInUse(u32),
@@ -54,7 +54,7 @@ impl fmt::Display for VsockConfigError {
             }
             InvalidGuestCid(cid) => write!(
                 f,
-                "Invalid guest CID {cid}: CIDs 0, 1 and 2 are reserved (host CID is 2)"
+                "Invalid guest CID {cid}: CIDs 0, 1, 2 and 4294967295 are reserved"
             ),
             GuestCidInUse(cid) => {
                 write!(f, "Guest CID {cid} is already assigned to another VM")
@@ -96,24 +96,25 @@ fn used_guest_cids() -> &'static Mutex<HashSet<u32>> {
 /// Allocate a process-unique guest CID.
 ///
 /// Returns CIDs starting at [`FIRST_GUEST_CID`] (3), monotonically increasing,
-/// and never returns 0, 1 or 2. CIDs pinned beforehand with
+/// and never returns 0, 1, 2 or the wildcard `u32::MAX`. CIDs pinned beforehand with
 /// [`reserve_guest_cid`] are skipped, never handed out twice. Shared by the
 /// Rust (`msb_krun`) and C (`libkrun`) VM-creation paths so VMs created
 /// through either API in one process never collide.
 pub fn allocate_guest_cid() -> Result<u32> {
-    let used = used_guest_cids();
+    allocate_guest_cid_from(&NEXT_GUEST_CID, used_guest_cids())
+}
+
+fn allocate_guest_cid_from(next_cid: &AtomicU32, used: &Mutex<HashSet<u32>>) -> Result<u32> {
     let mut guard = used.lock().unwrap();
     loop {
-        let cid = NEXT_GUEST_CID.load(Ordering::Relaxed);
-        if cid < FIRST_GUEST_CID {
-            // Counter wrapped past u32::MAX into the reserved range, which we
-            // use as the exhausted sentinel (see below).
+        let cid = next_cid.load(Ordering::Relaxed);
+        if cid < FIRST_GUEST_CID || cid == u32::MAX {
+            // The wildcard is the exhausted sentinel, never a guest identity.
+            // Also refuse an older allocator's wrapped/invalid counter state.
             return Err(VsockConfigError::GuestCidExhausted);
         }
-        // Claim `cid`; on wrap, park the counter on the 0 sentinel so later
-        // callers observe exhaustion instead of re-issuing low CIDs.
-        let next = cid.checked_add(1).unwrap_or(0);
-        if NEXT_GUEST_CID
+        let next = cid + 1;
+        if next_cid
             .compare_exchange_weak(cid, next, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
@@ -131,11 +132,11 @@ pub fn allocate_guest_cid() -> Result<u32> {
 
 /// Pin a specific guest CID for a VM.
 ///
-/// Rejects CIDs 0, 1 and 2 ([`VsockConfigError::InvalidGuestCid`]) and CIDs
+/// Rejects CIDs 0, 1, 2 and `u32::MAX` ([`VsockConfigError::InvalidGuestCid`]) and CIDs
 /// already allocated or reserved ([`VsockConfigError::GuestCidInUse`]); the
 /// allocator will never hand out a successfully reserved CID.
 pub fn reserve_guest_cid(cid: u32) -> Result<()> {
-    if cid < FIRST_GUEST_CID {
+    if cid < FIRST_GUEST_CID || cid == u32::MAX {
         return Err(VsockConfigError::InvalidGuestCid(cid));
     }
     let used = used_guest_cids();
@@ -277,6 +278,8 @@ impl VsockBuilder {
 pub(crate) mod tests {
     use std::io;
 
+    use proptest::prelude::*;
+
     use devices::virtio::vsock::{
         VsockDatagramBackend, VsockDatagramPeer, VsockDatagramPortBackend, VsockNotifier,
     };
@@ -353,7 +356,7 @@ pub(crate) mod tests {
 
         // The counter is process-global, so assert properties
         // (uniqueness/validity), never exact values.
-        for cid in [0, 1, 2] {
+        for cid in [0, 1, 2, u32::MAX] {
             assert!(
                 matches!(reserve_guest_cid(cid), Err(InvalidGuestCid(_))),
                 "CID {cid} must be rejected as reserved"
@@ -364,7 +367,7 @@ pub(crate) mod tests {
         for _ in 0..64 {
             let cid = allocate_guest_cid().expect("CID space must not exhaust in tests");
             assert!(
-                cid >= FIRST_GUEST_CID,
+                cid >= FIRST_GUEST_CID && cid < u32::MAX,
                 "allocated CID {cid} must not be reserved"
             );
             assert!(seen.insert(cid), "allocated CID {cid} handed out twice");
@@ -389,6 +392,82 @@ pub(crate) mod tests {
             if cid > pinned {
                 break;
             }
+        }
+    }
+
+    #[test]
+    fn allocator_exhaustion_never_issues_a_wildcard_or_wraps() {
+        let next = AtomicU32::new(u32::MAX - 1);
+        let used = Mutex::new(HashSet::new());
+        assert_eq!(allocate_guest_cid_from(&next, &used).unwrap(), u32::MAX - 1);
+        for _ in 0..3 {
+            assert!(matches!(
+                allocate_guest_cid_from(&next, &used),
+                Err(VsockConfigError::GuestCidExhausted)
+            ));
+        }
+        assert_eq!(next.load(Ordering::Relaxed), u32::MAX);
+        assert_eq!(*used.lock().unwrap(), HashSet::from([u32::MAX - 1]));
+    }
+
+    #[test]
+    fn allocator_refuses_reserved_states_without_mutating_reservations() {
+        for cid in [0, 1, 2, u32::MAX] {
+            let next = AtomicU32::new(cid);
+            let used = Mutex::new(HashSet::new());
+            assert!(matches!(
+                allocate_guest_cid_from(&next, &used),
+                Err(VsockConfigError::GuestCidExhausted)
+            ));
+            assert_eq!(next.load(Ordering::Relaxed), cid);
+            assert!(used.lock().unwrap().is_empty());
+        }
+        let next = AtomicU32::new(u32::MAX - 1);
+        let used = Mutex::new(HashSet::from([u32::MAX - 1]));
+        assert!(matches!(
+            allocate_guest_cid_from(&next, &used),
+            Err(VsockConfigError::GuestCidExhausted)
+        ));
+        assert_eq!(*used.lock().unwrap(), HashSet::from([u32::MAX - 1]));
+    }
+
+    proptest! {
+        #[test]
+        fn allocation_matches_ordered_available_ids(
+            start in prop_oneof![0u32..64, (u32::MAX - 64)..=u32::MAX, any::<u32>()],
+            offsets in proptest::collection::vec(0u8..64, 0..32),
+            attempts in 1usize..33,
+        ) {
+            let reserved: HashSet<u32> = offsets.into_iter()
+                .map(|offset| start.saturating_add(u32::from(offset)))
+                .filter(|cid| (3..u32::MAX).contains(cid))
+                .collect();
+            // The oracle enumerates a finite mathematical set using a wider
+            // integer, independently of the production atomic/CAS loop.
+            let expected: Vec<u32> = if (3..u32::MAX).contains(&start) {
+                (u64::from(start)..u64::from(u32::MAX))
+                    .take(96)
+                    .map(|cid| cid as u32)
+                    .filter(|cid| !reserved.contains(cid))
+                    .take(attempts)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let next = AtomicU32::new(start);
+            let used = Mutex::new(reserved.clone());
+            let mut actual = Vec::new();
+            for _ in 0..attempts {
+                match allocate_guest_cid_from(&next, &used) {
+                    Ok(cid) => actual.push(cid),
+                    Err(VsockConfigError::GuestCidExhausted) => {},
+                    Err(other) => prop_assert!(false, "unexpected allocation error: {other}"),
+                }
+            }
+            prop_assert_eq!(&actual, &expected);
+            let expected_used: HashSet<_> = reserved.into_iter().chain(expected).collect();
+            prop_assert_eq!(&*used.lock().unwrap(), &expected_used);
+            prop_assert!(next.load(Ordering::Relaxed) >= start);
         }
     }
 

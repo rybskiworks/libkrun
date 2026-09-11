@@ -22,7 +22,8 @@ pub type VsockPollable = RawHandle;
 /// Metadata for a guest-initiated connection to a registered host port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VsockConnectRequest {
-    /// CID of the guest opening the connection.
+    /// VMM-configured CID of the guest opening the connection.
+    /// Guest packet source CIDs must match this identity before dispatch.
     pub guest_cid: u64,
     /// Ephemeral source port selected by the guest.
     pub guest_port: u32,
@@ -42,7 +43,8 @@ pub enum VsockConnectState {
 /// Metadata identifying one guest datagram peer for a registered host port.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct VsockDatagramPeer {
-    /// CID of the guest sending datagrams.
+    /// VMM-configured CID of the guest sending datagrams.
+    /// Guest packet source CIDs must match this identity before dispatch.
     pub guest_cid: u64,
     /// Source port selected or bound by the guest.
     pub guest_port: u32,

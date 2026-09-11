@@ -290,6 +290,12 @@ pub enum MemoryPlacementResult {
 /// A data structure that encapsulates the device configurations
 /// held in the Vmm.
 pub struct VmResources {
+    /// Complete immutable private memory image installed before guest activation.
+    #[cfg(not(feature = "tee"))]
+    pub private_memory_backing: Option<crate::private_memory::PrivateMemoryBacking>,
+    /// Construct fresh RAM from private immutable zero backing before loading boot payloads.
+    #[cfg(not(feature = "tee"))]
+    pub private_memory_boot: bool,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// Resolved host logical processor for every possible vCPU thread.
@@ -368,6 +374,10 @@ pub struct VmResources {
     /// enforcement state every vCPU run loop consults.
     #[cfg(not(feature = "tee"))]
     pub cpu_device: Option<std::sync::Arc<std::sync::Mutex<devices::virtio::Cpu>>>,
+    /// The private VM-generation device used to reseed a restored guest kernel before workload
+    /// activation. It is present from boot so its driver state survives memory checkpoints.
+    #[cfg(not(feature = "tee"))]
+    pub generation_device: Option<std::sync::Arc<std::sync::Mutex<devices::virtio::Generation>>>,
     /// Guest memory stats polling interval for the virtio-balloon device.
     pub balloon_stats_interval: Option<Duration>,
     /// Whether to attach the virtio-rng device.
@@ -388,6 +398,10 @@ pub struct VmResources {
 impl Default for VmResources {
     fn default() -> Self {
         Self {
+            #[cfg(not(feature = "tee"))]
+            private_memory_backing: None,
+            #[cfg(not(feature = "tee"))]
+            private_memory_boot: false,
             vm_config: VmConfig::default(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             vcpu_affinity: None,
@@ -432,6 +446,8 @@ impl Default for VmResources {
             mem_device: None,
             #[cfg(not(feature = "tee"))]
             cpu_device: None,
+            #[cfg(not(feature = "tee"))]
+            generation_device: None,
             balloon_stats_interval: Some(Duration::from_secs(1)),
             enable_rng: true,
             enable_msb_metrics: true,

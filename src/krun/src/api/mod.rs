@@ -43,6 +43,8 @@ pub use builder::VmBuilder;
 pub use builders::DiskBuilder;
 #[cfg(feature = "blk")]
 pub use builders::DiskImageFormat;
+#[cfg(feature = "blk")]
+pub use builders::DiskLayer;
 #[cfg(not(target_os = "windows"))]
 pub use builders::FsBuilder;
 #[cfg(feature = "net")]
@@ -55,6 +57,10 @@ pub use builders::{
     MachineBuilder, MemoryPlacementResult, NumaBuilder, NumaDistance, NumaNodeBuilder,
     NumaNodeConfig, NumaTopology, PlacementReport, VcpuPlacementResult,
 };
+#[cfg(feature = "blk")]
+pub use devices::virtio::block::{ImageType as BlockImageFormat, SyncMode as BlockSyncMode};
+#[cfg(feature = "blk")]
+pub use devices::virtio::{BlockBackendSpec, BlockLayerSpec, PreparedBlockBackend};
 pub use error::{BuildError, ConfigError, Error, Result, RuntimeError};
 pub use exit_handle::ExitHandle;
 pub use metrics::{
@@ -63,4 +69,22 @@ pub use metrics::{
 };
 pub use vm::Vm;
 #[cfg(not(feature = "tee"))]
-pub use vm::{VmControl, VmCpuState, VmMemoryState};
+pub use vm::{
+    VmControl, VmCpuState, VmExecutionState, VmGenerationId, VmGenerationRequest,
+    VmGenerationState, VmGenerationWaitOutcome, VmMemoryRestoreSource, VmMemoryRestoreTarget,
+    VmMemoryState, VmPauseGeneration,
+};
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+pub use vmm::device_state::{BlockDeviceState, VirtioDeviceState};
+#[cfg(not(feature = "tee"))]
+pub use vmm::execution_state::{
+    ExecutionArchitecture, ExecutionBackend, ExecutionState, VcpuExecutionState,
+};
+#[cfg(not(feature = "tee"))]
+pub use vmm::memory_state::{
+    FullCaptureReason, GuestMemoryRange, IncrementalCaptureDecision, MemoryBaselineToken,
+    MemoryCaptureKind, MemoryCaptureOptions, MemoryCapturePlan, MemoryCaptureSink,
+    MemoryCaptureStats, MemoryGeneration, MemoryTopologyGeneration,
+};
+#[cfg(not(feature = "tee"))]
+pub use vmm::private_memory::{PrivateMemoryBacking, PrivateMemoryRegion};

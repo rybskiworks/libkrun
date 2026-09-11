@@ -6,15 +6,17 @@ use super::{
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{
-    accept, bind, connect, getsockopt, listen, recv, send, shutdown, socket, sockopt,
-    AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, UnixAddr,
+    connect, getsockopt, recv, send, shutdown, socket, sockopt, AddressFamily, MsgFlags, Shutdown,
+    SockFlag, SockType, UnixAddr,
 };
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::num::Wrapping;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -806,29 +808,69 @@ impl AsRawFd for UnixProxy {
     }
 }
 
+/// A listener belongs to the device, not to one activation's proxy table.
+/// The caller must keep its parent directory private to the supervisor.
+pub struct BoundUnixListener {
+    listener: UnixListener,
+    path: PathBuf,
+    identity: (u64, u64),
+}
+
+impl BoundUnixListener {
+    pub fn bind(path: &PathBuf) -> io::Result<Self> {
+        // Never unlink an existing endpoint to make a new launch succeed.
+        let listener = UnixListener::bind(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        let bound = Self {
+            listener,
+            path: path.clone(),
+            identity: (metadata.dev(), metadata.ino()),
+        };
+        bound.listener.set_nonblocking(true)?;
+        Ok(bound)
+    }
+
+    pub fn check_path(&self) -> io::Result<()> {
+        let metadata = std::fs::symlink_metadata(&self.path)?;
+        if (metadata.dev(), metadata.ino()) != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "vsock listener pathname no longer belongs to this device",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AsRawFd for BoundUnixListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+}
+
+impl Drop for BoundUnixListener {
+    fn drop(&mut self) {
+        // Do not remove a replacement launch's endpoint. This is lifecycle
+        // ownership, not a defense against an attacker controlling the parent.
+        if self.check_path().is_ok() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub struct UnixAcceptorProxy {
     id: u64,
-    fd: OwnedFd,
+    listener: Arc<BoundUnixListener>,
     peer_port: u32,
 }
 
 impl UnixAcceptorProxy {
-    pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
-        let fd = socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::empty(),
-            None,
-        )
-        .map_err(ProxyError::CreatingSocket)?;
-        bind(
-            fd.as_raw_fd(),
-            &UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?,
-        )
-        .map_err(ProxyError::CreatingSocket)?;
-        listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
-            .map_err(ProxyError::CreatingSocket)?;
-        Ok(UnixAcceptorProxy { id, fd, peer_port })
+    pub fn new(id: u64, listener: Arc<BoundUnixListener>, peer_port: u32) -> Self {
+        Self {
+            id,
+            listener,
+            peer_port,
+        }
     }
 }
 
@@ -843,16 +885,14 @@ impl Proxy for UnixAcceptorProxy {
         ProxyStatus::WaitingOnAccept
     }
     fn connect(&mut self, _: &VsockPacket, _: TsiConnectReq) -> ProxyUpdate {
-        unreachable!()
+        ProxyUpdate::default()
     }
-    fn getpeername(&mut self, _: &VsockPacket) {
-        unreachable!()
-    }
+    fn getpeername(&mut self, _: &VsockPacket) {}
     fn sendmsg(&mut self, _: &VsockPacket) -> ProxyUpdate {
-        unreachable!()
+        ProxyUpdate::default()
     }
     fn sendto_addr(&mut self, _: TsiSendtoAddr) -> ProxyUpdate {
-        unreachable!()
+        ProxyUpdate::default()
     }
     fn listen(
         &mut self,
@@ -860,35 +900,34 @@ impl Proxy for UnixAcceptorProxy {
         _: TsiListenReq,
         _: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate {
-        unreachable!()
+        ProxyUpdate::default()
     }
     fn accept(&mut self, _: TsiAcceptReq) -> ProxyUpdate {
-        unreachable!()
+        ProxyUpdate::default()
     }
     fn update_peer_credit(&mut self, _: &VsockPacket) -> ProxyUpdate {
-        unreachable!()
+        ProxyUpdate::default()
     }
     fn process_op_response(&mut self, _: &VsockPacket) -> ProxyUpdate {
-        unreachable!()
+        ProxyUpdate::default()
     }
     fn release(&mut self) -> ProxyUpdate {
-        unreachable!()
+        ProxyUpdate::default()
     }
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
         if evset.contains(EventSet::HANG_UP) {
             debug!("process_event: HANG_UP");
-            update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::empty()));
+            update.polling = Some((self.id, self.as_raw_fd(), EventSet::empty()));
             update.signal_queue = true;
             update.remove_proxy = ProxyRemoval::Deferred;
             return update;
         }
         if evset.contains(EventSet::IN) {
-            match accept(self.fd.as_raw_fd()) {
-                Ok(accept_fd) => {
-                    // Safe because we've just obtained the FD from the `accept` call above.
-                    let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
+            match self.listener.listener.accept() {
+                Ok((stream, _)) => {
+                    let new_fd = stream.into();
                     update.new_proxy = Some((
                         self.peer_port,
                         new_fd,
@@ -896,6 +935,7 @@ impl Proxy for UnixAcceptorProxy {
                         NewProxyType::Unix,
                     ));
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => warn!("error accepting connection: id={}, err={}", self.id, e),
             };
             update.signal_queue = true;
@@ -906,6 +946,6 @@ impl Proxy for UnixAcceptorProxy {
 
 impl AsRawFd for UnixAcceptorProxy {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.listener.as_raw_fd()
     }
 }

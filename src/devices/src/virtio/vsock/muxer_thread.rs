@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-use std::os::unix::io::RawFd;
-use std::path::PathBuf;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -10,13 +8,15 @@ use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
-use crate::virtio::vsock::defs;
-use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
+use crate::virtio::vsock::unix::UnixProxy;
 use crate::virtio::InterruptTransport;
 use crossbeam_channel::Sender;
 use rand::{rng, rngs::ThreadRng, Rng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
+
+pub(super) const STOP_EVENT: u64 = u64::MAX;
 
 pub struct MuxerThread {
     cid: u64,
@@ -27,7 +27,7 @@ pub struct MuxerThread {
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
-    unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    stop_evt: EventFd,
 }
 
 impl MuxerThread {
@@ -41,7 +41,7 @@ impl MuxerThread {
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
-        unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+        stop_evt: EventFd,
     ) -> Self {
         MuxerThread {
             cid,
@@ -52,15 +52,14 @@ impl MuxerThread {
             queue,
             interrupt,
             reaper_sender,
-            unix_ipc_port_map,
+            stop_evt,
         }
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> std::io::Result<thread::JoinHandle<()>> {
         thread::Builder::new()
             .name("vsock muxer".into())
             .spawn(|| self.work())
-            .unwrap();
     }
 
     fn send_credit_request(&self, credit_rx: MuxerRx) {
@@ -149,32 +148,9 @@ impl MuxerThread {
         }
     }
 
-    fn create_lisening_ipc_sockets(&self) {
-        for (port, (path, do_listen)) in &self.unix_ipc_port_map {
-            if !do_listen {
-                continue;
-            }
-            let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            let proxy = match UnixAcceptorProxy::new(id, path, *port) {
-                Ok(proxy) => proxy,
-                Err(e) => {
-                    warn!("Failed to create listening proxy at {path:?}: {e:?}");
-                    continue;
-                }
-            };
-            self.proxy_map
-                .write()
-                .unwrap()
-                .insert(id, Mutex::new(Box::new(proxy)));
-            if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                self.update_polling(id, proxy.lock().unwrap().pollable(), EventSet::IN);
-            };
-        }
-    }
-
     fn work(self) {
         let mut thread_rng = rng();
-        self.create_lisening_ipc_sockets();
+        let stop_fd = self.stop_evt.as_raw_fd();
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self
@@ -182,6 +158,21 @@ impl MuxerThread {
                 .wait(epoll_events.len(), -1, epoll_events.as_mut_slice())
             {
                 Ok(ev_cnt) => {
+                    // Stop has priority over backend readiness from the same wait batch. Once the
+                    // owner asks for quiescence, no additional proxy event may consume a queue or
+                    // write guest memory.
+                    if epoll_events[..ev_cnt]
+                        .iter()
+                        .any(|event| event.data() == STOP_EVENT)
+                    {
+                        let _ = self.stop_evt.read();
+                        let _ = self.epoll.ctl(
+                            ControlOperation::Delete,
+                            stop_fd,
+                            &EpollEvent::default(),
+                        );
+                        return;
+                    }
                     for ev in &epoll_events[0..ev_cnt] {
                         debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();

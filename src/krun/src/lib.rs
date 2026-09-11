@@ -44,6 +44,8 @@ pub use api::builders::CacheMode;
 pub use api::builders::DiskBuilder;
 #[cfg(feature = "blk")]
 pub use api::builders::DiskImageFormat;
+#[cfg(feature = "blk")]
+pub use api::builders::DiskLayer;
 pub use api::builders::FsBuilder;
 #[cfg(feature = "net")]
 pub use api::builders::NetBuilder;
@@ -65,7 +67,26 @@ pub use api::metrics::{
 };
 pub use api::vm::Vm;
 #[cfg(not(feature = "tee"))]
-pub use api::vm::{VmControl, VmCpuState, VmMemoryState};
+pub use api::vm::{
+    VmControl, VmCpuState, VmExecutionState, VmGenerationId, VmGenerationRequest,
+    VmGenerationState, VmGenerationWaitOutcome, VmMemoryRestoreSource, VmMemoryRestoreTarget,
+    VmMemoryState, VmPauseGeneration,
+};
+#[cfg(feature = "blk")]
+pub use api::{
+    BlockBackendSpec, BlockImageFormat, BlockLayerSpec, BlockSyncMode, PreparedBlockBackend,
+};
+#[cfg(all(feature = "blk", not(feature = "tee")))]
+pub use api::{BlockDeviceState, VirtioDeviceState};
+#[cfg(not(feature = "tee"))]
+pub use api::{
+    ExecutionArchitecture, ExecutionBackend, ExecutionState, FullCaptureReason, GuestMemoryRange,
+    IncrementalCaptureDecision, MemoryBaselineToken, MemoryCaptureKind, MemoryCaptureOptions,
+    MemoryCapturePlan, MemoryCaptureSink, MemoryCaptureStats, MemoryGeneration,
+    MemoryTopologyGeneration, VcpuExecutionState,
+};
+#[cfg(not(feature = "tee"))]
+pub use api::{PrivateMemoryBacking, PrivateMemoryRegion};
 #[cfg(feature = "net")]
 pub use devices::virtio::net::rate_limit::{
     RateLimiterConfig, RateLimiterConfigError, TokenBucketConfig,
